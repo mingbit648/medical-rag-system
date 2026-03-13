@@ -1,0 +1,8 @@
+﻿--extra-index-url https://download.pytorch.org/whl/cpu
+
+# 可选：启用真实 embedding、Cross-Encoder rerank 与 Chroma 持久化
+chromadb>=0.4.22
+sentence-transformers==3.3.1
+transformers==4.46.3
+torch==2.5.1+cpu
+scikit-learn>=1.3.0

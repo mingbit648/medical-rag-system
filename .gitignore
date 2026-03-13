@@ -1,0 +1,14 @@
+.env
+**/.env
+api-key.md
+**/node_modules/
+**/.next/
+medical-rag-system/.codex-skill-staging/
+**/__pycache__/
+**/*.pyc
+**/*.log
+**/*.sqlite3
+**/*.db
+**/*.tsbuildinfo
+medical-rag-system/backend/data/
+medical-rag-system/frontend/out/

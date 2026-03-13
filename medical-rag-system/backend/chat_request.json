@@ -1,0 +1,1 @@
+﻿{"query":"拖欠工资怎么办","topn":{"bm25":20,"vector":20},"fusion":{"method":"rrf","k":60},"rerank":{"topk":10,"topm":3},"llm":{"provider":"mock","model":"mock-legal","temperature":0.2}}

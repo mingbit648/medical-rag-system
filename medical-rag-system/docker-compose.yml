@@ -1,0 +1,94 @@
+﻿# ============================================================
+# 法律辅助咨询 RAG 系统 - Docker Compose 配置
+#
+# 默认构建基础可部署版本：PostgreSQL + Backend + Frontend
+# 如需启用真实 embedding / Cross-Encoder，可将 BACKEND_INSTALL_ML=true
+# ============================================================
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: legal-rag-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres123}
+      POSTGRES_DB: ${POSTGRES_DB:-legal_rag}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - rag_network
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: dockerfile
+      args:
+        INSTALL_ML: ${BACKEND_INSTALL_ML:-false}
+    container_name: legal-rag-backend
+    ports:
+      - "8001:8000"
+    environment:
+      TZ: Asia/Shanghai
+      DEBUG: "false"
+      ENVIRONMENT: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres123}@postgres:5432/${POSTGRES_DB:-legal_rag}
+      VECTOR_DB_BACKEND: ${VECTOR_DB_BACKEND:-memory}
+      CHROMA_PERSIST_DIR: /app/data/chroma
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      SILICONFLOW_API_KEY: ${SILICONFLOW_API_KEY:-}
+      SILICONFLOW_BASE_URL: ${SILICONFLOW_BASE_URL:-https://api.siliconflow.cn/v1}
+      SILICONFLOW_EMBED_MODEL: ${SILICONFLOW_EMBED_MODEL:-BAAI/bge-large-zh-v1.5}
+      SILICONFLOW_RERANK_MODEL: ${SILICONFLOW_RERANK_MODEL:-BAAI/bge-reranker-v2-m3}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-siliconflow}
+      RERANK_PROVIDER: ${RERANK_PROVIDER:-siliconflow}
+    volumes:
+      - ./backend/data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks:
+      - rag_network
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: dockerfile
+    container_name: legal-rag-frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:3000/"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+    networks:
+      - rag_network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  rag_network:
+    driver: bridge
+

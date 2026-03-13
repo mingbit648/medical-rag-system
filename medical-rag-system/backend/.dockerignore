@@ -1,0 +1,11 @@
+﻿__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+data/
+backend.err.log
+backend.out.log
+smoke.err.log
+smoke.out.log
