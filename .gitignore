@@ -12,3 +12,9 @@ medical-rag-system/.codex-skill-staging/
 **/*.tsbuildinfo
 medical-rag-system/backend/data/
 medical-rag-system/frontend/out/
+/.vscode/
+/api.md
+/上次改造结果.md
+/技术方案.md
+/需求文档.md
+/国家法律法规数据/
