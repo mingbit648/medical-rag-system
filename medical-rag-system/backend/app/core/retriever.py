@@ -51,7 +51,11 @@ def rank_dense(
     if len(vector_chunk_ids) == 0:
         return []
 
-    query_embedding = embedding_service.embed_texts([query])
+    try:
+        query_embedding = embedding_service.embed_texts([query])
+    except Exception as exc:  # pragma: no cover
+        logger.warning("embedding query failed, dense retrieval disabled for this request: %s", exc)
+        return []
     if query_embedding.size == 0:
         return []
     query_vec = query_embedding[0]

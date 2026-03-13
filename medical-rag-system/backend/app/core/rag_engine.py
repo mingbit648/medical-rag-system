@@ -163,7 +163,14 @@ class LegalRagService:
             return
         from .text_utils import l2_normalize_rows
         texts = [self.chunk_lookup[cid].chunk_text for cid in chunk_ids]
-        embeddings = self.embedding_service.embed_texts(texts)
+        try:
+            embeddings = self.embedding_service.embed_texts(texts)
+        except Exception as exc:
+            logger.warning("rebuild vector index failed, fallback to empty vector index: %s", exc)
+            self.vector_chunk_ids = []
+            self.vector_matrix = np.zeros((0, 1), dtype=np.float32)
+            self._clear_chroma()
+            return
         embeddings = np.asarray(embeddings, dtype=np.float32)
         embeddings = l2_normalize_rows(embeddings)
         self.vector_chunk_ids = chunk_ids
