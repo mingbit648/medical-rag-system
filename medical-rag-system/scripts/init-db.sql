@@ -4,6 +4,7 @@ CREATE TABLE IF NOT EXISTS documents (
     doc_type     TEXT NOT NULL DEFAULT 'pdf',
     source_url   TEXT,
     file_path    TEXT,
+    content_text TEXT,
     published_at TEXT,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     parse_status TEXT NOT NULL DEFAULT 'imported',

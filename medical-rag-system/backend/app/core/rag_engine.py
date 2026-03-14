@@ -295,20 +295,20 @@ class LegalRagService:
         }
 
     def get_doc_status(self, doc_id):
-        doc = self.repo.get_document(doc_id)
+        doc = self.repo.get_document(doc_id, include_text=False)
         if doc is None:
             raise KeyError("文档不存在")
         return {"doc_id": doc["doc_id"], "title": doc["title"], "doc_type": doc["doc_type"],
                 "parse_status": doc["parse_status"], "chunks": doc.get("chunks", 0), "created_at": doc["created_at"]}
 
     def list_docs(self):
-        docs = self.repo.list_documents()
+        docs = self.repo.list_documents(include_text=False)
         return [{"doc_id": d["doc_id"], "title": d["title"], "doc_type": d["doc_type"],
                  "parse_status": d["parse_status"], "chunks": d.get("chunks", 0), "created_at": d["created_at"]} for d in docs]
 
     def delete_document(self, doc_id: str) -> bool:
         """删除文档及其关联数据，并重建索引缓存。"""
-        doc = self.repo.get_document(doc_id)
+        doc = self.repo.get_document(doc_id, include_text=False)
         if doc is None:
             raise KeyError("文档不存在")
         file_path = self._resolve_doc_file_path(doc)
@@ -564,7 +564,7 @@ class LegalRagService:
         }
 
     def get_document_file(self, doc_id: str) -> Dict[str, Any]:
-        doc = self.repo.get_document(doc_id)
+        doc = self.repo.get_document(doc_id, include_text=False)
         if doc is None:
             raise KeyError("文档不存在")
         file_path = self._ensure_original_viewable(doc)
@@ -581,7 +581,7 @@ class LegalRagService:
         if citation is None:
             raise KeyError("引用不存在")
 
-        doc = self.repo.get_document(citation["doc_id"])
+        doc = self.repo.get_document(citation["doc_id"], include_text=False)
         chunk = self.chunk_lookup.get(citation["chunk_id"])
         if doc is None or chunk is None:
             raise KeyError("引用对应文档或片段不存在")

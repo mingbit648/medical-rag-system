@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 def make_citation(repo, hit: Dict[str, Any], persist: bool = True, message_id: str | None = None) -> Dict[str, Any]:
-    doc = repo.get_document(hit["doc_id"])
+    doc = repo.get_document(hit["doc_id"], include_text=False)
     if doc is None:
         raise KeyError("引用对应文档不存在")
 

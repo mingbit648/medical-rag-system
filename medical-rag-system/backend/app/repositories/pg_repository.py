@@ -22,6 +22,7 @@ class PgRepository:
     def _ensure_schema_extensions(self) -> None:
         with self._cursor(dict_cursor=False) as cur:
             cur.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS file_path TEXT")
+            cur.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS content_text TEXT")
             cur.execute("ALTER TABLE chunks ADD COLUMN IF NOT EXISTS locator_json JSONB DEFAULT '{}'::jsonb")
 
             cur.execute(f"ALTER TABLE sessions ADD COLUMN IF NOT EXISTS title TEXT NOT NULL DEFAULT '{DEFAULT_SESSION_TITLE}'")
@@ -67,6 +68,21 @@ class PgRepository:
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     meta_json JSONB DEFAULT '{}'::jsonb
                 )
+                """
+            )
+
+            cur.execute(
+                """
+                UPDATE documents
+                SET
+                    content_text = COALESCE(content_text, meta_json->>'text'),
+                    meta_json = CASE
+                        WHEN meta_json IS NULL THEN '{}'::jsonb
+                        WHEN meta_json ? 'text' THEN meta_json - 'text'
+                        ELSE meta_json
+                    END
+                WHERE content_text IS NULL
+                   OR (meta_json IS NOT NULL AND meta_json ? 'text')
                 """
             )
 
@@ -199,7 +215,7 @@ class PgRepository:
         if isinstance(meta, str):
             meta = json.loads(meta)
         row["meta_json"] = meta
-        row["text"] = meta.get("text", "")
+        row["text"] = row.get("content_text") or meta.get("text", "")
         row["chunks"] = meta.get("chunks", 0)
         row["file_name"] = meta.get("original_file_name") or row.get("file_path", "")
         row["original_file_name"] = meta.get("original_file_name")
@@ -240,41 +256,69 @@ class PgRepository:
 
     def upsert_document(self, payload: Dict[str, Any]) -> None:
         meta = payload.get("meta") or {
-            "text": payload.get("text", ""),
             "chunks": payload.get("chunks", 0),
             "domain": payload.get("domain", "劳动法/通用"),
         }
         with self._cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO documents(doc_id, title, doc_type, source_url, file_path, created_at, parse_status, meta_json)
-                VALUES(%(doc_id)s, %(title)s, %(doc_type)s, %(source_url)s, %(file_path)s, %(created_at)s, %(parse_status)s, %(meta_json)s)
+                INSERT INTO documents(
+                    doc_id, title, doc_type, source_url, file_path, content_text, created_at, parse_status, meta_json
+                )
+                VALUES(
+                    %(doc_id)s, %(title)s, %(doc_type)s, %(source_url)s, %(file_path)s,
+                    %(content_text)s, %(created_at)s, %(parse_status)s, %(meta_json)s
+                )
                 ON CONFLICT(doc_id) DO UPDATE SET
                     title = EXCLUDED.title,
                     doc_type = EXCLUDED.doc_type,
                     source_url = EXCLUDED.source_url,
                     file_path = EXCLUDED.file_path,
+                    content_text = EXCLUDED.content_text,
                     parse_status = EXCLUDED.parse_status,
                     meta_json = EXCLUDED.meta_json
                 """,
                 {
                     **payload,
                     "file_path": payload.get("file_path") or payload.get("file_name"),
+                    "content_text": payload.get("content_text") or payload.get("text", ""),
                     "meta_json": json.dumps(meta, ensure_ascii=False),
                 },
             )
 
-    def get_document(self, doc_id: str) -> Optional[Dict[str, Any]]:
+    @staticmethod
+    def _document_select_columns(include_text: bool) -> str:
+        base_columns = [
+            "doc_id",
+            "title",
+            "doc_type",
+            "source_url",
+            "file_path",
+            "published_at",
+            "created_at",
+            "parse_status",
+            "meta_json",
+        ]
+        if include_text:
+            base_columns.append("content_text")
+        return ", ".join(base_columns)
+
+    def get_document(self, doc_id: str, *, include_text: bool = True) -> Optional[Dict[str, Any]]:
         with self._cursor() as cur:
-            cur.execute("SELECT * FROM documents WHERE doc_id = %s", (doc_id,))
+            cur.execute(
+                f"SELECT {self._document_select_columns(include_text)} FROM documents WHERE doc_id = %s",
+                (doc_id,),
+            )
             row = cur.fetchone()
         if not row:
             return None
         return self._doc_row_to_dict(dict(row))
 
-    def list_documents(self) -> List[Dict[str, Any]]:
+    def list_documents(self, *, include_text: bool = True) -> List[Dict[str, Any]]:
         with self._cursor() as cur:
-            cur.execute("SELECT * FROM documents ORDER BY created_at DESC")
+            cur.execute(
+                f"SELECT {self._document_select_columns(include_text)} FROM documents ORDER BY created_at DESC"
+            )
             rows = cur.fetchall()
         return [self._doc_row_to_dict(dict(row)) for row in rows]
 
