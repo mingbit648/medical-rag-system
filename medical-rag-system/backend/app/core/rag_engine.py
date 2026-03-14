@@ -95,45 +95,11 @@ class LegalRagService:
         return file_path
 
     @staticmethod
-    def _make_blocks_from_spans(text: str, spans: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        blocks: List[Dict[str, Any]] = []
-        for span in spans:
-            start = max(0, min(int(span.get("start", 0)), len(text)))
-            end = max(start, min(int(span.get("end", start)), len(text)))
-            blocks.append(
-                {
-                    "index": int(span.get("index") or span.get("page") or len(blocks) + 1),
-                    "text": text[start:end],
-                    "start": start,
-                    "end": end,
-                }
-            )
-        return blocks
-
-    @staticmethod
-    def _split_text_blocks(text: str) -> List[Dict[str, Any]]:
-        if not text:
-            return [{"index": 1, "text": "", "start": 0, "end": 0}]
-
-        blocks: List[Dict[str, Any]] = []
-        cursor = 0
-        block_index = 1
-        for chunk in text.split("\n\n"):
-            start = text.find(chunk, cursor)
-            if start < 0:
-                start = cursor
-            end = start + len(chunk)
-            blocks.append({"index": block_index, "text": chunk, "start": start, "end": end})
-            block_index += 1
-            cursor = end + 2
-        return blocks or [{"index": 1, "text": text, "start": 0, "end": len(text)}]
-
-    @staticmethod
-    def _locate_highlight_blocks(blocks: List[Dict[str, Any]], start_pos: int, end_pos: int) -> Dict[str, int]:
-        overlapping = [block for block in blocks if block["end"] > start_pos and block["start"] < end_pos]
-        if not overlapping:
-            return {"block_start": blocks[0]["index"], "block_end": blocks[0]["index"]}
-        return {"block_start": overlapping[0]["index"], "block_end": overlapping[-1]["index"]}
+    def _normalize_highlight_range(text: str, start_pos: int, end_pos: int) -> Dict[str, int]:
+        text_length = len(text)
+        start = max(0, min(int(start_pos), text_length))
+        end = max(start, min(int(end_pos), text_length))
+        return {"start": start, "end": end}
 
     # ─── ChromaDB 初始化 ──────────────────────────────────
     def _init_chroma(self) -> None:
@@ -646,16 +612,7 @@ class LegalRagService:
         self._ensure_original_viewable(doc)
 
         full_text = doc.get("text", "")
-        if doc.get("doc_type") == "docx" and doc.get("paragraph_spans"):
-            blocks = self._make_blocks_from_spans(full_text, doc["paragraph_spans"])
-        else:
-            blocks = self._split_text_blocks(full_text)
-
-        highlight = {
-            "start": chunk.start_pos,
-            "end": chunk.end_pos,
-            **self._locate_highlight_blocks(blocks, chunk.start_pos, chunk.end_pos),
-        }
+        highlight = self._normalize_highlight_range(full_text, chunk.start_pos, chunk.end_pos)
 
         return {
             "doc_id": doc_id,
@@ -663,7 +620,7 @@ class LegalRagService:
             "doc_type": doc["doc_type"],
             "viewer_mode": doc.get("viewer_mode") or "structured_text",
             "download_url": f"{settings.API_PREFIX}/docs/{doc_id}/file",
-            "blocks": blocks,
+            "text": full_text,
             "highlight": highlight,
             "citation_meta": {
                 "section": chunk.section,

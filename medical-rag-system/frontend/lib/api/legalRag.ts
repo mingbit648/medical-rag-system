@@ -130,25 +130,16 @@ export interface CitationOpenTarget {
     viewer_ready: boolean
 }
 
-export interface ViewerBlock {
-    index: number
-    text: string
-    start: number
-    end: number
-}
-
 export interface DocumentViewerContent {
     doc_id: string
     title: string
     doc_type: string
     viewer_mode: string
     download_url: string
-    blocks: ViewerBlock[]
+    text: string
     highlight: {
         start: number
         end: number
-        block_start: number
-        block_end: number
     }
     citation_meta: {
         section?: string | null
