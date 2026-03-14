@@ -111,6 +111,7 @@ class PgRepository:
                 """
             )
             cur.execute("UPDATE sessions SET message_count = 0 WHERE message_count IS NULL")
+            self._mark_empty_sessions_deleted(cur)
 
             cur.execute(
                 """
@@ -236,6 +237,22 @@ class PgRepository:
         row["last_message_role"] = meta.get("last_message_role")
         row["last_user_query"] = meta.get("last_user_query")
         return row
+
+    def _mark_empty_sessions_deleted(self, cur) -> None:
+        cur.execute(
+            """
+            UPDATE sessions s
+            SET status = 'deleted',
+                updated_at = COALESCE(updated_at, last_active_at, created_at)
+            WHERE COALESCE(s.message_count, 0) = 0
+              AND COALESCE(s.status, 'active') <> 'deleted'
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM messages m
+                    WHERE m.session_id = s.session_id
+                )
+            """
+        )
 
     @classmethod
     def _message_row_to_dict(cls, row: Dict[str, Any]) -> Dict[str, Any]:
@@ -550,6 +567,7 @@ class PgRepository:
             SELECT *
             FROM sessions
             WHERE (%s IS NULL OR status = %s)
+              AND COALESCE(message_count, 0) > 0
             ORDER BY updated_at DESC, created_at DESC
             LIMIT %s
             """,

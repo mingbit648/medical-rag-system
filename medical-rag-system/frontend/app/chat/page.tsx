@@ -15,8 +15,20 @@ import {
 import MarkdownIt from 'markdown-it'
 import { resolveApiUrl } from '@/lib/api/client'
 import {
+    buildFallbackSessionSummary,
+    DRAFT_VIEW_KEY,
+    remapOptimisticMessages,
+    resolveInitialActiveView,
+    sortConversations,
+    upsertConversation,
+    type ActiveView,
+    type ChatMessage,
+    type ConversationRecord,
+    type DraftState,
+} from '@/lib/chat/sessionState'
+import {
+    chatCompletionStream,
     chatSessionMessageStream,
-    createChatSession,
     deleteChatSession,
     getChatSessionDetail,
     getCitationOpenTarget,
@@ -36,32 +48,13 @@ const QUICK_PROMPTS = [
     '被违法辞退后，申请仲裁的常见步骤是什么？',
 ]
 const ACTIVE_STORAGE_KEY = 'legal-rag-chat-active-session'
-const DRAFTS_STORAGE_KEY = 'legal-rag-chat-drafts'
 const timeFormatter = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' })
 const dayFormatter = new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit' })
-
-interface ChatMessage {
-    id: string
-    role: 'user' | 'assistant'
-    content: string
-    citations?: CitationItem[]
-    timestamp: number
-    status: 'streaming' | 'completed' | 'error'
-}
-
-interface ConversationRecord extends ChatSessionSummary {
-    messages: ChatMessage[]
-    loaded: boolean
-}
 
 interface HighlightPieces {
     before: string
     hit: string
     after: string
-}
-
-function sortConversations(items: ConversationRecord[]) {
-    return [...items].sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime())
 }
 
 function formatConversationTime(timestamp: string) {
@@ -132,29 +125,36 @@ function resolveOpenTargetUrl(url: string) {
 
 export default function ChatPage() {
     const [conversations, setConversations] = useState<ConversationRecord[]>([])
-    const [activeConversationId, setActiveConversationId] = useState('')
-    const [drafts, setDrafts] = useState<Record<string, string>>({})
+    const [activeView, setActiveView] = useState<ActiveView>({ kind: 'draft' })
+    const [draftState, setDraftState] = useState<DraftState>({ input: '', messages: [] })
+    const [sessionInput, setSessionInput] = useState('')
     const [bootstrapping, setBootstrapping] = useState(true)
-    const [streamingSessionId, setStreamingSessionId] = useState('')
+    const [streamingViewKey, setStreamingViewKey] = useState('')
     const [citationDrawerOpen, setCitationDrawerOpen] = useState(false)
     const [viewingCitation, setViewingCitation] = useState<CitationViewData | null>(null)
     const [viewingCitationLoading, setViewingCitationLoading] = useState(false)
     const bottomRef = useRef<HTMLDivElement>(null)
     const highlightRef = useRef<HTMLElement>(null)
 
-    const activeConversation = conversations.find((item) => item.session_id === activeConversationId) ?? null
-    const currentMessages = activeConversation?.messages ?? []
-    const inputValue = drafts[activeConversationId] || ''
+    const activeSessionId = activeView.kind === 'session' ? activeView.sessionId : ''
+    const activeConversation = activeSessionId
+        ? conversations.find((item) => item.session_id === activeSessionId) ?? null
+        : null
+    const currentMessages = activeView.kind === 'draft' ? draftState.messages : activeConversation?.messages ?? []
+    const inputValue = activeView.kind === 'draft' ? draftState.input : sessionInput
     const highlightPieces = toHighlightPieces(viewingCitation)
     const citationCount = currentMessages.reduce((sum, item) => sum + (item.citations?.length ?? 0), 0)
-    const streaming = streamingSessionId === activeConversationId
-    const conversationStateLabel = streaming
-        ? '正在生成回复'
-        : activeConversation?.status === 'archived'
-            ? '已归档会话'
-            : activeConversation
-                ? '知识库会话已连接'
-                : '正在加载会话'
+    const currentViewKey = activeView.kind === 'draft' ? DRAFT_VIEW_KEY : activeView.sessionId
+    const streaming = Boolean(streamingViewKey) && streamingViewKey === currentViewKey
+    const conversationStateLabel = bootstrapping
+        ? '正在加载会话'
+        : streaming
+            ? '正在生成回复'
+            : activeView.kind === 'draft'
+                ? '新对话'
+                : activeConversation?.status === 'archived'
+                    ? '已归档会话'
+                    : '准备就绪'
 
     useEffect(() => {
         let cancelled = false
@@ -162,34 +162,23 @@ export default function ChatPage() {
         async function bootstrap() {
             try {
                 const storedActive = window.localStorage.getItem(ACTIVE_STORAGE_KEY) || ''
-                const storedDrafts = window.localStorage.getItem(DRAFTS_STORAGE_KEY)
-                if (storedDrafts) {
-                    try {
-                        setDrafts(JSON.parse(storedDrafts))
-                    } catch {
-                        setDrafts({})
-                    }
-                }
-
                 const listed = await listChatSessions()
-                const items = listed.items.length > 0 ? listed.items : [await createChatSession()]
                 if (cancelled) return
 
-                const mapped = sortConversations(items.map((session) => ({ ...session, messages: [], loaded: false })))
-                const nextActiveId = mapped.some((item) => item.session_id === storedActive)
-                    ? storedActive
-                    : mapped[0]?.session_id || ''
+                const mapped = sortConversations(listed.items.map((session) => ({ ...session, messages: [], loaded: false })))
+                const nextActiveView = resolveInitialActiveView(mapped, storedActive)
 
                 setConversations(mapped)
-                setActiveConversationId(nextActiveId)
+                setActiveView(nextActiveView)
+                setSessionInput('')
 
-                if (nextActiveId) {
-                    const detail = await getChatSessionDetail(nextActiveId)
+                if (nextActiveView.kind === 'session') {
+                    const detail = await getChatSessionDetail(nextActiveView.sessionId)
                     if (cancelled) return
                     setConversations((prev) =>
                         sortConversations(
                             prev.map((item) =>
-                                item.session_id === nextActiveId
+                                item.session_id === nextActiveView.sessionId
                                     ? {
                                         ...mergeSummary(item, detail.session),
                                         messages: detail.messages.map(mapServerMessage).filter(Boolean) as ChatMessage[],
@@ -214,13 +203,12 @@ export default function ChatPage() {
     }, [])
 
     useEffect(() => {
-        if (!activeConversationId) return
-        window.localStorage.setItem(ACTIVE_STORAGE_KEY, activeConversationId)
-    }, [activeConversationId])
-
-    useEffect(() => {
-        window.localStorage.setItem(DRAFTS_STORAGE_KEY, JSON.stringify(drafts))
-    }, [drafts])
+        if (activeView.kind === 'session') {
+            window.localStorage.setItem(ACTIVE_STORAGE_KEY, activeView.sessionId)
+            return
+        }
+        window.localStorage.removeItem(ACTIVE_STORAGE_KEY)
+    }, [activeView])
 
     useEffect(() => {
         if (!viewingCitation || viewingCitationLoading || !highlightRef.current) return
@@ -229,10 +217,40 @@ export default function ChatPage() {
 
     useEffect(() => {
         window.setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' }), 60)
-    }, [activeConversationId, currentMessages.length])
+    }, [currentViewKey, currentMessages.length])
+
+    useEffect(() => {
+        if (activeView.kind !== 'session') return
+        if (conversations.some((item) => item.session_id === activeView.sessionId)) return
+        setActiveView(resolveInitialActiveView(conversations, ''))
+        setSessionInput('')
+    }, [activeView, conversations])
 
     function updateConversation(sessionId: string, updater: (conversation: ConversationRecord) => ConversationRecord) {
         setConversations((prev) => sortConversations(prev.map((item) => (item.session_id === sessionId ? updater(item) : item))))
+    }
+
+    function syncConversationSummary(
+        session: ChatSessionSummary,
+        options: { messages?: ChatMessage[]; loaded?: boolean } = {}
+    ) {
+        setConversations((prev) => {
+            const existing = prev.find((item) => item.session_id === session.session_id)
+            const merged: ConversationRecord = {
+                ...mergeSummary(existing, session),
+                messages: options.messages ?? existing?.messages ?? [],
+                loaded: options.loaded ?? existing?.loaded ?? false,
+            }
+            return upsertConversation(prev, merged)
+        })
+    }
+
+    function setComposerValue(value: string) {
+        if (activeView.kind === 'draft') {
+            setDraftState((prev) => ({ ...prev, input: value }))
+            return
+        }
+        setSessionInput(value)
     }
 
     async function loadConversation(sessionId: string, force = false) {
@@ -255,25 +273,22 @@ export default function ChatPage() {
     }
 
     async function handleNewConversation() {
-        if (streamingSessionId) {
-            message.warning('当前有会话正在回复，请稍后再创建新会话')
+        if (streamingViewKey && streamingViewKey !== DRAFT_VIEW_KEY) {
+            message.warning('当前有会话正在回复，请稍后再切换到新对话')
             return
         }
-        try {
-            const created = await createChatSession()
-            setConversations((prev) => sortConversations([{ ...created, messages: [], loaded: true }, ...prev]))
-            setActiveConversationId(created.session_id)
-        } catch (err: any) {
-            message.error(err?.message || '创建会话失败')
-        }
+        if (activeView.kind === 'draft') return
+        setActiveView({ kind: 'draft' })
+        setSessionInput('')
     }
 
     async function handleSelectConversation(sessionId: string) {
-        if (streamingSessionId && sessionId !== activeConversationId) {
+        if (streamingViewKey && streamingViewKey !== sessionId) {
             message.warning('当前回复尚未完成，暂不允许切换会话')
             return
         }
-        setActiveConversationId(sessionId)
+        setActiveView({ kind: 'session', sessionId })
+        setSessionInput('')
         try {
             await loadConversation(sessionId)
         } catch (err: any) {
@@ -282,23 +297,23 @@ export default function ChatPage() {
     }
 
     async function handleDeleteConversation(sessionId: string) {
-        if (streamingSessionId === sessionId) {
+        if (streamingViewKey === sessionId) {
             message.warning('当前会话正在回复，暂不允许删除')
             return
         }
         try {
             await deleteChatSession(sessionId)
             const remaining = conversations.filter((item) => item.session_id !== sessionId)
-            if (remaining.length === 0) {
-                const created = await createChatSession()
-                setConversations([{ ...created, messages: [], loaded: true }])
-                setActiveConversationId(created.session_id)
-                return
-            }
             const sorted = sortConversations(remaining)
             setConversations(sorted)
-            if (sessionId === activeConversationId) {
-                setActiveConversationId(sorted[0].session_id)
+            if (activeView.kind === 'session' && sessionId === activeView.sessionId) {
+                if (sorted.length === 0) {
+                    setActiveView({ kind: 'draft' })
+                    setSessionInput('')
+                    return
+                }
+                setActiveView({ kind: 'session', sessionId: sorted[0].session_id })
+                setSessionInput('')
                 await loadConversation(sorted[0].session_id)
             }
         } catch (err: any) {
@@ -307,9 +322,8 @@ export default function ChatPage() {
     }
 
     async function handleSend() {
-        if (!activeConversation) return
         const query = inputValue.trim()
-        if (!query || streamingSessionId) return
+        if (!query || streamingViewKey) return
 
         const now = Date.now()
         const requestId = `req_${now}_${Math.random().toString(36).slice(2, 8)}`
@@ -321,7 +335,163 @@ export default function ChatPage() {
             { id: tempAssistantId, role: 'assistant', content: '', timestamp: now + 1, status: 'streaming' },
         ]
 
-        updateConversation(activeConversation.session_id, (item) => ({
+        if (activeView.kind === 'draft') {
+            let promotedSessionId = ''
+            let userMessageId = tempUserId
+            let assistantMessageId = tempAssistantId
+            let assistantContent = ''
+
+            const promoteDraftConversation = (payload: {
+                session_id: string
+                user_message_id?: string
+                assistant_message_id?: string
+                citations?: CitationItem[]
+                session?: ChatSessionSummary
+            }) => {
+                userMessageId = payload.user_message_id || userMessageId
+                assistantMessageId = payload.assistant_message_id || assistantMessageId
+                const sessionSummary = payload.session || buildFallbackSessionSummary(payload.session_id, query, now)
+                syncConversationSummary(sessionSummary, {
+                    messages: remapOptimisticMessages(optimisticMessages, {
+                        optimisticUserId: tempUserId,
+                        optimisticAssistantId: tempAssistantId,
+                        userMessageId,
+                        assistantMessageId,
+                        assistantContent,
+                        citations: payload.citations,
+                        assistantStatus: 'streaming',
+                    }),
+                    loaded: true,
+                })
+                promotedSessionId = sessionSummary.session_id
+                setDraftState({ input: '', messages: [] })
+                setActiveView({ kind: 'session', sessionId: sessionSummary.session_id })
+                setSessionInput('')
+                setStreamingViewKey(sessionSummary.session_id)
+            }
+
+            setDraftState({ input: '', messages: optimisticMessages })
+            setStreamingViewKey(DRAFT_VIEW_KEY)
+
+            try {
+                await chatCompletionStream(
+                    { query, request_id: requestId },
+                    {
+                        onMetadata: (payload) => {
+                            if (!promotedSessionId) {
+                                promoteDraftConversation(payload)
+                                return
+                            }
+                            if (payload.session) {
+                                syncConversationSummary(payload.session)
+                            }
+                        },
+                        onToken: (token) => {
+                            assistantContent += token
+                            if (promotedSessionId) {
+                                updateConversation(promotedSessionId, (item) => ({
+                                    ...item,
+                                    updated_at: new Date().toISOString(),
+                                    messages: item.messages.map((messageItem) =>
+                                        messageItem.id === assistantMessageId
+                                            ? { ...messageItem, content: messageItem.content + token }
+                                            : messageItem
+                                    ),
+                                }))
+                                return
+                            }
+                            setDraftState((prev) => ({
+                                ...prev,
+                                messages: prev.messages.map((messageItem) =>
+                                    messageItem.id === tempAssistantId
+                                        ? { ...messageItem, content: messageItem.content + token }
+                                        : messageItem
+                                ),
+                            }))
+                        },
+                        onDone: (payload) => {
+                            if (!promotedSessionId) {
+                                promoteDraftConversation(payload)
+                            }
+                            userMessageId = payload.user_message_id || userMessageId
+                            assistantMessageId = payload.assistant_message_id || assistantMessageId
+                            updateConversation(payload.session_id, (item) => ({
+                                ...mergeSummary(item, payload.session || item),
+                                messages: remapOptimisticMessages(item.messages, {
+                                    optimisticUserId: tempUserId,
+                                    optimisticAssistantId: tempAssistantId,
+                                    userMessageId,
+                                    assistantMessageId,
+                                    assistantContent,
+                                    citations: payload.citations,
+                                    assistantStatus: 'completed',
+                                }),
+                                loaded: true,
+                            }))
+                        },
+                        onError: (errMsg) => {
+                            const failureText = assistantContent || `生成失败：${errMsg}`
+                            if (promotedSessionId) {
+                                updateConversation(promotedSessionId, (item) => ({
+                                    ...item,
+                                    updated_at: new Date().toISOString(),
+                                    messages: item.messages.map((messageItem) =>
+                                        messageItem.id === assistantMessageId
+                                            ? { ...messageItem, status: 'error', content: failureText }
+                                            : messageItem
+                                    ),
+                                }))
+                                return
+                            }
+                            setDraftState((prev) => ({
+                                ...prev,
+                                messages: prev.messages.map((messageItem) =>
+                                    messageItem.id === tempAssistantId
+                                        ? { ...messageItem, status: 'error', content: failureText }
+                                        : messageItem
+                                ),
+                            }))
+                        },
+                    }
+                )
+                if (promotedSessionId) {
+                    await loadConversation(promotedSessionId, true)
+                }
+            } catch (err: any) {
+                const failureText = assistantContent || `请求失败：${err?.message || '未知错误'}`
+                if (promotedSessionId) {
+                    updateConversation(promotedSessionId, (item) => ({
+                        ...item,
+                        updated_at: new Date().toISOString(),
+                        messages: item.messages.map((messageItem) =>
+                            messageItem.id === assistantMessageId
+                                ? { ...messageItem, status: 'error', content: failureText }
+                                : messageItem
+                        ),
+                    }))
+                } else {
+                    setDraftState((prev) => ({
+                        ...prev,
+                        messages: prev.messages.map((messageItem) =>
+                            messageItem.id === tempAssistantId
+                                ? { ...messageItem, status: 'error', content: failureText }
+                                : messageItem
+                        ),
+                    }))
+                }
+            } finally {
+                setStreamingViewKey('')
+            }
+            return
+        }
+
+        if (!activeConversation) return
+
+        const sessionId = activeConversation.session_id
+        let userMessageId = tempUserId
+        let assistantMessageId = tempAssistantId
+
+        updateConversation(sessionId, (item) => ({
             ...item,
             messages: optimisticMessages,
             loaded: true,
@@ -330,47 +500,62 @@ export default function ChatPage() {
             message_count: item.message_count + 2,
             title: item.title || query.slice(0, 28),
         }))
-        setDrafts((prev) => ({ ...prev, [activeConversation.session_id]: '' }))
-        setStreamingSessionId(activeConversation.session_id)
+        setSessionInput('')
+        setStreamingViewKey(sessionId)
 
         try {
             await chatSessionMessageStream(
-                activeConversation.session_id,
+                sessionId,
                 { query, request_id: requestId },
                 {
                     onMetadata: (payload) => {
-                        if (payload.session) {
-                            updateConversation(activeConversation.session_id, (item) => mergeSummary(item, payload.session!))
-                        }
+                        userMessageId = payload.user_message_id || userMessageId
+                        assistantMessageId = payload.assistant_message_id || assistantMessageId
+                        updateConversation(sessionId, (item) => ({
+                            ...mergeSummary(item, payload.session || item),
+                            messages: remapOptimisticMessages(item.messages, {
+                                optimisticUserId: tempUserId,
+                                optimisticAssistantId: tempAssistantId,
+                                userMessageId,
+                                assistantMessageId,
+                                assistantStatus: 'streaming',
+                            }),
+                            loaded: true,
+                        }))
                     },
                     onToken: (token) => {
-                        updateConversation(activeConversation.session_id, (item) => ({
+                        updateConversation(sessionId, (item) => ({
                             ...item,
                             updated_at: new Date().toISOString(),
                             messages: item.messages.map((messageItem) =>
-                                messageItem.id === tempAssistantId
+                                messageItem.id === assistantMessageId
                                     ? { ...messageItem, content: messageItem.content + token }
                                     : messageItem
                             ),
                         }))
                     },
                     onDone: (payload) => {
-                        updateConversation(activeConversation.session_id, (item) => ({
+                        userMessageId = payload.user_message_id || userMessageId
+                        assistantMessageId = payload.assistant_message_id || assistantMessageId
+                        updateConversation(sessionId, (item) => ({
                             ...mergeSummary(item, payload.session || item),
-                            messages: item.messages.map((messageItem) =>
-                                messageItem.id === tempAssistantId
-                                    ? { ...messageItem, citations: payload.citations, status: 'completed' }
-                                    : messageItem
-                            ),
+                            messages: remapOptimisticMessages(item.messages, {
+                                optimisticUserId: tempUserId,
+                                optimisticAssistantId: tempAssistantId,
+                                userMessageId,
+                                assistantMessageId,
+                                citations: payload.citations,
+                                assistantStatus: 'completed',
+                            }),
                             loaded: true,
                         }))
                     },
                     onError: (errMsg) => {
-                        updateConversation(activeConversation.session_id, (item) => ({
+                        updateConversation(sessionId, (item) => ({
                             ...item,
                             updated_at: new Date().toISOString(),
                             messages: item.messages.map((messageItem) =>
-                                messageItem.id === tempAssistantId
+                                messageItem.id === assistantMessageId || messageItem.id === tempAssistantId
                                     ? {
                                         ...messageItem,
                                         status: 'error',
@@ -382,19 +567,19 @@ export default function ChatPage() {
                     },
                 }
             )
-            await loadConversation(activeConversation.session_id, true)
+            await loadConversation(sessionId, true)
         } catch (err: any) {
-            updateConversation(activeConversation.session_id, (item) => ({
+            updateConversation(sessionId, (item) => ({
                 ...item,
                 updated_at: new Date().toISOString(),
                 messages: item.messages.map((messageItem) =>
-                    messageItem.id === tempAssistantId
+                    messageItem.id === assistantMessageId || messageItem.id === tempAssistantId
                         ? { ...messageItem, status: 'error', content: `请求失败：${err?.message || '未知错误'}` }
                         : messageItem
                 ),
             }))
         } finally {
-            setStreamingSessionId('')
+            setStreamingViewKey('')
         }
     }
 
@@ -428,7 +613,6 @@ export default function ChatPage() {
                         <span className="chat-sidebar-kicker">LEGAL DESK</span>
                         <div className="chat-sidebar-heading">
                             <h2 className="chat-sidebar-title">法律咨询工作台</h2>
-                            <p className="chat-sidebar-copy">会话、历史消息和上下文摘要已切换为服务端管理。</p>
                         </div>
                         <div className="chat-sidebar-stats">
                             <span>{conversations.length} 个会话</span>
@@ -448,25 +632,23 @@ export default function ChatPage() {
                             <div key={conversation.session_id} className="chat-session-row">
                                 <button
                                     type="button"
-                                    className={`chat-session-item${conversation.session_id === activeConversationId ? ' active' : ''}`}
+                                    className={`chat-session-item${activeView.kind === 'session' && conversation.session_id === activeView.sessionId ? ' active' : ''}`}
                                     onClick={() => void handleSelectConversation(conversation.session_id)}
                                 >
                                     <span className="chat-session-title">{conversation.title}</span>
                                     <span className="chat-session-preview">{getConversationPreview(conversation)}</span>
                                     <span className="chat-session-time">{formatConversationTime(conversation.updated_at)}</span>
                                 </button>
-                                {conversations.length > 1 ? (
-                                    <Tooltip title="删除对话">
-                                        <button
-                                            type="button"
-                                            className="chat-session-delete"
-                                            onClick={() => void handleDeleteConversation(conversation.session_id)}
-                                            aria-label="删除对话"
-                                        >
-                                            <DeleteOutlined />
-                                        </button>
-                                    </Tooltip>
-                                ) : null}
+                                <Tooltip title="删除对话">
+                                    <button
+                                        type="button"
+                                        className="chat-session-delete"
+                                        onClick={() => void handleDeleteConversation(conversation.session_id)}
+                                        aria-label="删除对话"
+                                    >
+                                        <DeleteOutlined />
+                                    </button>
+                                </Tooltip>
                             </div>
                         ))}
                     </div>
@@ -476,13 +658,13 @@ export default function ChatPage() {
                     <header className="chat-main-header">
                         <div className="chat-main-heading">
                             <span className="chat-main-kicker">{conversationStateLabel}</span>
-                            <h1 className="chat-main-title">{activeConversation?.title || '加载中'}</h1>
+                            <h1 className="chat-main-title">{bootstrapping ? '加载中' : activeConversation?.title || '开始新对话'}</h1>
                             <p className="chat-main-meta">
                                 {bootstrapping
-                                    ? '正在同步服务端会话'
+                                    ? '正在加载会话'
                                     : currentMessages.length > 0
                                         ? `${currentMessages.length} 条消息 · ${citationCount} 条引用`
-                                        : '从服务端新建会话开始，消息和上下文均持久化到数据库'}
+                                        : '开始新会话'}
                             </p>
                         </div>
                         <div className="chat-main-actions">
@@ -504,14 +686,14 @@ export default function ChatPage() {
                                 <section className="chat-empty">
                                     <span className="chat-empty-kicker">START WITH FACTS</span>
                                     <h2 className="chat-empty-title">开始新对话</h2>
-                                    <p className="chat-empty-copy">描述时间、地区、劳动关系和你的目标，服务端会话会自动记录历史与上下文。</p>
+                                    <p className="chat-empty-copy">描述时间、地区、劳动关系和你的目标。</p>
                                     <div className="chat-empty-prompts">
                                         {QUICK_PROMPTS.map((prompt) => (
                                             <button
                                                 key={prompt}
                                                 type="button"
                                                 className="chat-empty-prompt"
-                                                onClick={() => setDrafts((prev) => ({ ...prev, [activeConversationId]: prompt }))}
+                                                onClick={() => setComposerValue(prompt)}
                                             >
                                                 {prompt}
                                             </button>
@@ -578,25 +760,27 @@ export default function ChatPage() {
                     <footer className="chat-input-area">
                         <div className="chat-input-panel">
                             <div className="chat-input-inner">
+                                <div className="chat-input-editor">
                                 <TextArea
                                     value={inputValue}
-                                    onChange={(e) => setDrafts((prev) => ({ ...prev, [activeConversationId]: e.target.value }))}
+                                    onChange={(e) => setComposerValue(e.target.value)}
                                     onPressEnter={(e) => {
                                         if (!e.shiftKey) {
                                             e.preventDefault()
                                             void handleSend()
                                         }
                                     }}
-                                    placeholder="输入问题，消息与上下文会持久化到数据库"
+                                    placeholder="输入问题"
                                     autoSize={{ minRows: 1, maxRows: 8 }}
-                                    disabled={!activeConversationId || streaming}
+                                    disabled={bootstrapping || streaming || (activeView.kind === 'session' && !activeConversation)}
                                     style={{ resize: 'none' }}
                                 />
+                                </div>
                                 <button
                                     type="button"
                                     className="chat-send-btn"
                                     onClick={() => void handleSend()}
-                                    disabled={!inputValue.trim() || !activeConversationId || streaming}
+                                    disabled={!inputValue.trim() || bootstrapping || streaming || (activeView.kind === 'session' && !activeConversation)}
                                     aria-label="发送消息"
                                 >
                                     <SendOutlined />
