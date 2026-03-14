@@ -4,12 +4,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
+from app.core.rag_engine import get_engine
 from app.routers import chat, citations, docs, experiments, retrieve
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     print("RAG service starting...")
+    get_engine()
     yield
     print("RAG service stopped.")
 

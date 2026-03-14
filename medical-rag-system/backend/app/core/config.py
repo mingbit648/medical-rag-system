@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     API_PREFIX: str = "/api/v1"
     CORS_ALLOW_ORIGINS: str = "*"
     DATA_DIR: str = "data"
+    UPLOAD_DIR: str = "data/uploads"
     DATABASE_URL: str = "postgresql://postgres:postgres123@localhost:5432/legal_rag"
 
     CHUNK_SIZE: int = 800
@@ -22,6 +23,16 @@ class Settings(BaseSettings):
     HISTORY_WINDOW_MESSAGES: int = 8
     HISTORY_PROMPT_MESSAGES: int = 6
     ENABLE_HISTORY_FOR_RETRIEVAL: bool = True
+    SESSION_CONTEXT_KEEP_RECENT_MESSAGES: int = 6
+    SESSION_SUMMARY_TRIGGER_MESSAGES: int = 10
+    SESSION_SUMMARY_SOURCE_MESSAGES: int = 80
+    SESSION_SUMMARY_MAX_CHARS: int = 1200
+    SESSION_SUMMARY_MAX_USER_ITEMS: int = 6
+    SESSION_SUMMARY_MAX_ASSISTANT_ITEMS: int = 4
+    SESSION_SUMMARY_ITEM_MAX_CHARS: int = 180
+    RETRIEVAL_SHORT_QUERY_CHARS: int = 24
+    RETRIEVAL_HISTORY_USER_MESSAGES: int = 2
+    SESSION_STREAM_STALE_SECONDS: int = 300
 
     EMBEDDING_PROVIDER: str = "siliconflow"
     EMBED_MODEL_NAME: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"

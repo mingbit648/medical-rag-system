@@ -46,6 +46,25 @@ class LLMOption(BaseModel):
 
 class ChatCompletionRequest(BaseModel):
     session_id: Optional[str] = None
+    request_id: Optional[str] = None
+    query: str = Field(min_length=1)
+    topn: TopNOption = TopNOption()
+    fusion: FusionOption = FusionOption()
+    rerank: RerankOption = RerankOption()
+    llm: LLMOption = LLMOption()
+
+
+class ChatSessionCreateRequest(BaseModel):
+    title: Optional[str] = None
+
+
+class ChatSessionUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    status: Optional[str] = None
+
+
+class ChatSessionMessageRequest(BaseModel):
+    request_id: Optional[str] = None
     query: str = Field(min_length=1)
     topn: TopNOption = TopNOption()
     fusion: FusionOption = FusionOption()

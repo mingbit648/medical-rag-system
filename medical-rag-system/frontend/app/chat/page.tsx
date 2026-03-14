@@ -1,49 +1,44 @@
-﻿'use client'
+'use client'
 
-import { useState, useRef, useCallback, useMemo, useEffect } from 'react'
-import { Button, Input, Upload, message, Tooltip, Tag, Drawer, Empty, Spin, Collapse } from 'antd'
+import { useEffect, useRef, useState } from 'react'
+import Link from 'next/link'
+import { Drawer, Empty, Input, Spin, Tooltip, message } from 'antd'
 import {
-    SendOutlined,
-    PaperClipOutlined,
-    FileTextOutlined,
-    InfoCircleOutlined,
-    HighlightOutlined,
-    ClearOutlined,
-    BugOutlined,
-    SafetyCertificateOutlined,
     DatabaseOutlined,
+    DeleteOutlined,
+    ExportOutlined,
+    HighlightOutlined,
+    InfoCircleOutlined,
+    PlusOutlined,
+    SendOutlined,
 } from '@ant-design/icons'
 import MarkdownIt from 'markdown-it'
+import { resolveApiUrl } from '@/lib/api/client'
 import {
-    chatCompletionStream,
-    importDocument,
-    indexDocument,
-    getDocumentStatus,
+    chatSessionMessageStream,
+    createChatSession,
+    deleteChatSession,
+    getChatSessionDetail,
+    getCitationOpenTarget,
     getCitationView,
+    listChatSessions,
+    type ChatHistoryMessage,
+    type ChatSessionSummary,
     type CitationItem,
     type CitationViewData,
 } from '@/lib/api/legalRag'
 
 const { TextArea } = Input
-
 const md = new MarkdownIt({ html: false, linkify: true, typographer: true })
-
 const QUICK_PROMPTS = [
-    '公司拖欠工资时，劳动者应先收集哪些证据？',
-    '劳动合同到期不续签，经济补偿应如何计算？',
-    '被违法辞退后，申请劳动仲裁通常需要哪些材料？',
+    '公司拖欠工资，劳动仲裁前要准备哪些证据？',
+    '劳动合同到期不续签，经济补偿怎么算？',
+    '被违法辞退后，申请仲裁的常见步骤是什么？',
 ]
-
-const WORKFLOW_NOTES = [
-    '先上传 PDF、HTML、TXT 或 DOCX，系统会建立可检索索引。',
-    '回答会附上引用来源与命中文本，便于快速核对依据。',
-    '当前界面仅用于辅助检索与学习，不替代律师意见。',
-]
-
-const timeFormatter = new Intl.DateTimeFormat('zh-CN', {
-    hour: '2-digit',
-    minute: '2-digit',
-})
+const ACTIVE_STORAGE_KEY = 'legal-rag-chat-active-session'
+const DRAFTS_STORAGE_KEY = 'legal-rag-chat-drafts'
+const timeFormatter = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' })
+const dayFormatter = new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit' })
 
 interface ChatMessage {
     id: string
@@ -51,12 +46,59 @@ interface ChatMessage {
     content: string
     citations?: CitationItem[]
     timestamp: number
+    status: 'streaming' | 'completed' | 'error'
+}
+
+interface ConversationRecord extends ChatSessionSummary {
+    messages: ChatMessage[]
+    loaded: boolean
 }
 
 interface HighlightPieces {
     before: string
     hit: string
     after: string
+}
+
+function sortConversations(items: ConversationRecord[]) {
+    return [...items].sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime())
+}
+
+function formatConversationTime(timestamp: string) {
+    const date = new Date(timestamp)
+    const now = new Date()
+    const isSameDay =
+        date.getFullYear() === now.getFullYear() &&
+        date.getMonth() === now.getMonth() &&
+        date.getDate() === now.getDate()
+    return isSameDay ? timeFormatter.format(date) : dayFormatter.format(date)
+}
+
+function mapServerMessage(item: ChatHistoryMessage): ChatMessage | null {
+    if ((item.role !== 'user' && item.role !== 'assistant') || typeof item.content !== 'string') return null
+    return {
+        id: item.message_id || item.msg_id,
+        role: item.role,
+        content: item.content,
+        citations: item.citations,
+        timestamp: new Date(item.created_at).getTime(),
+        status: (item.status as ChatMessage['status']) || 'completed',
+    }
+}
+
+function mergeSummary(existing: ConversationRecord | undefined, session: ChatSessionSummary): ConversationRecord {
+    return {
+        ...existing,
+        ...session,
+        messages: existing?.messages || [],
+        loaded: existing?.loaded || false,
+    }
+}
+
+function getConversationPreview(conversation: ConversationRecord) {
+    const latestMessage = [...conversation.messages].reverse().find((item) => item.content.trim())
+    if (latestMessage) return latestMessage.content.replace(/\s+/g, ' ').trim().slice(0, 42)
+    return (conversation.preview || '空白对话').replace(/\s+/g, ' ').trim().slice(0, 42)
 }
 
 function toHighlightPieces(view: CitationViewData | null): HighlightPieces | null {
@@ -80,427 +122,493 @@ function toHighlightPieces(view: CitationViewData | null): HighlightPieces | nul
     return { before: '', hit: view.context_text, after: '' }
 }
 
-function formatMessageTime(timestamp: number): string {
-    return timeFormatter.format(new Date(timestamp))
+function resolveOpenTargetUrl(url: string) {
+    if (!url || /^https?:\/\//.test(url) || !url.startsWith('/api/')) return url
+    const hashIndex = url.indexOf('#')
+    const path = hashIndex >= 0 ? url.slice(0, hashIndex) : url
+    const hash = hashIndex >= 0 ? url.slice(hashIndex) : ''
+    return `${resolveApiUrl(path)}${hash}`
 }
 
 export default function ChatPage() {
-    const [messages, setMessages] = useState<ChatMessage[]>([])
-    const [inputValue, setInputValue] = useState('')
-    const [sessionId, setSessionId] = useState('')
-    const [streaming, setStreaming] = useState(false)
-    const [docId, setDocId] = useState('')
-    const [indexing, setIndexing] = useState(false)
-    const [indexStatus, setIndexStatus] = useState('')
+    const [conversations, setConversations] = useState<ConversationRecord[]>([])
+    const [activeConversationId, setActiveConversationId] = useState('')
+    const [drafts, setDrafts] = useState<Record<string, string>>({})
+    const [bootstrapping, setBootstrapping] = useState(true)
+    const [streamingSessionId, setStreamingSessionId] = useState('')
     const [citationDrawerOpen, setCitationDrawerOpen] = useState(false)
     const [viewingCitation, setViewingCitation] = useState<CitationViewData | null>(null)
     const [viewingCitationLoading, setViewingCitationLoading] = useState(false)
-
     const bottomRef = useRef<HTMLDivElement>(null)
     const highlightRef = useRef<HTMLElement>(null)
 
-    useEffect(() => {
-        if (viewingCitation && !viewingCitationLoading && highlightRef.current) {
-            window.setTimeout(() => {
-                highlightRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-            }, 100)
-        }
-    }, [viewingCitation, viewingCitationLoading])
+    const activeConversation = conversations.find((item) => item.session_id === activeConversationId) ?? null
+    const currentMessages = activeConversation?.messages ?? []
+    const inputValue = drafts[activeConversationId] || ''
+    const highlightPieces = toHighlightPieces(viewingCitation)
+    const citationCount = currentMessages.reduce((sum, item) => sum + (item.citations?.length ?? 0), 0)
+    const streaming = streamingSessionId === activeConversationId
+    const conversationStateLabel = streaming
+        ? '正在生成回复'
+        : activeConversation?.status === 'archived'
+            ? '已归档会话'
+            : activeConversation
+                ? '知识库会话已连接'
+                : '正在加载会话'
 
-    const scrollToBottom = useCallback(() => {
-        window.setTimeout(() => {
-            bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-        }, 50)
+    useEffect(() => {
+        let cancelled = false
+
+        async function bootstrap() {
+            try {
+                const storedActive = window.localStorage.getItem(ACTIVE_STORAGE_KEY) || ''
+                const storedDrafts = window.localStorage.getItem(DRAFTS_STORAGE_KEY)
+                if (storedDrafts) {
+                    try {
+                        setDrafts(JSON.parse(storedDrafts))
+                    } catch {
+                        setDrafts({})
+                    }
+                }
+
+                const listed = await listChatSessions()
+                const items = listed.items.length > 0 ? listed.items : [await createChatSession()]
+                if (cancelled) return
+
+                const mapped = sortConversations(items.map((session) => ({ ...session, messages: [], loaded: false })))
+                const nextActiveId = mapped.some((item) => item.session_id === storedActive)
+                    ? storedActive
+                    : mapped[0]?.session_id || ''
+
+                setConversations(mapped)
+                setActiveConversationId(nextActiveId)
+
+                if (nextActiveId) {
+                    const detail = await getChatSessionDetail(nextActiveId)
+                    if (cancelled) return
+                    setConversations((prev) =>
+                        sortConversations(
+                            prev.map((item) =>
+                                item.session_id === nextActiveId
+                                    ? {
+                                        ...mergeSummary(item, detail.session),
+                                        messages: detail.messages.map(mapServerMessage).filter(Boolean) as ChatMessage[],
+                                        loaded: true,
+                                    }
+                                    : item
+                            )
+                        )
+                    )
+                }
+            } catch (err: any) {
+                message.error(err?.message || '加载会话失败')
+            } finally {
+                if (!cancelled) setBootstrapping(false)
+            }
+        }
+
+        void bootstrap()
+        return () => {
+            cancelled = true
+        }
     }, [])
 
-    const handleSend = useCallback(async () => {
-        const query = inputValue.trim()
-        if (!query || streaming) return
+    useEffect(() => {
+        if (!activeConversationId) return
+        window.localStorage.setItem(ACTIVE_STORAGE_KEY, activeConversationId)
+    }, [activeConversationId])
 
-        const now = Date.now()
-        const assistantId = `assistant_${now}`
+    useEffect(() => {
+        window.localStorage.setItem(DRAFTS_STORAGE_KEY, JSON.stringify(drafts))
+    }, [drafts])
 
-        setMessages((prev) => [
-            ...prev,
-            {
-                id: `user_${now}`,
-                role: 'user',
-                content: query,
-                timestamp: now,
-            },
-            {
-                id: assistantId,
-                role: 'assistant',
-                content: '',
-                timestamp: now + 1,
-            },
-        ])
-        setInputValue('')
-        setStreaming(true)
-        scrollToBottom()
+    useEffect(() => {
+        if (!viewingCitation || viewingCitationLoading || !highlightRef.current) return
+        window.setTimeout(() => highlightRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 100)
+    }, [viewingCitation, viewingCitationLoading])
 
-        try {
-            await chatCompletionStream(
-                { session_id: sessionId || undefined, query },
-                {
-                    onToken: (token) => {
-                        setMessages((prev) =>
-                            prev.map((item) =>
-                                item.id === assistantId ? { ...item, content: item.content + token } : item
-                            )
-                        )
-                        scrollToBottom()
-                    },
-                    onDone: (payload) => {
-                        setSessionId(payload.session_id)
-                        setMessages((prev) =>
-                            prev.map((item) =>
-                                item.id === assistantId
-                                    ? { ...item, citations: payload.citations }
-                                    : item
-                            )
-                        )
-                        scrollToBottom()
-                    },
-                    onError: (errMsg) => {
-                        setMessages((prev) =>
-                            prev.map((item) =>
-                                item.id === assistantId
-                                    ? { ...item, content: item.content || `生成失败：${errMsg}` }
-                                    : item
-                            )
-                        )
-                    },
-                }
-            )
-        } catch (err: any) {
-            setMessages((prev) =>
+    useEffect(() => {
+        window.setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' }), 60)
+    }, [activeConversationId, currentMessages.length])
+
+    function updateConversation(sessionId: string, updater: (conversation: ConversationRecord) => ConversationRecord) {
+        setConversations((prev) => sortConversations(prev.map((item) => (item.session_id === sessionId ? updater(item) : item))))
+    }
+
+    async function loadConversation(sessionId: string, force = false) {
+        const target = conversations.find((item) => item.session_id === sessionId)
+        if (!force && target?.loaded) return
+        const detail = await getChatSessionDetail(sessionId)
+        setConversations((prev) =>
+            sortConversations(
                 prev.map((item) =>
-                    item.id === assistantId
-                        ? { ...item, content: `请求失败：${err?.message || '未知错误'}` }
+                    item.session_id === sessionId
+                        ? {
+                            ...mergeSummary(item, detail.session),
+                            messages: detail.messages.map(mapServerMessage).filter(Boolean) as ChatMessage[],
+                            loaded: true,
+                        }
                         : item
                 )
             )
-        } finally {
-            setStreaming(false)
-        }
-    }, [inputValue, scrollToBottom, sessionId, streaming])
+        )
+    }
 
-    const handleFileUpload = useCallback(async (file: File) => {
-        setIndexing(true)
-        setIndexStatus('正在导入文档...')
+    async function handleNewConversation() {
+        if (streamingSessionId) {
+            message.warning('当前有会话正在回复，请稍后再创建新会话')
+            return
+        }
+        try {
+            const created = await createChatSession()
+            setConversations((prev) => sortConversations([{ ...created, messages: [], loaded: true }, ...prev]))
+            setActiveConversationId(created.session_id)
+        } catch (err: any) {
+            message.error(err?.message || '创建会话失败')
+        }
+    }
+
+    async function handleSelectConversation(sessionId: string) {
+        if (streamingSessionId && sessionId !== activeConversationId) {
+            message.warning('当前回复尚未完成，暂不允许切换会话')
+            return
+        }
+        setActiveConversationId(sessionId)
+        try {
+            await loadConversation(sessionId)
+        } catch (err: any) {
+            message.error(err?.message || '加载会话失败')
+        }
+    }
+
+    async function handleDeleteConversation(sessionId: string) {
+        if (streamingSessionId === sessionId) {
+            message.warning('当前会话正在回复，暂不允许删除')
+            return
+        }
+        try {
+            await deleteChatSession(sessionId)
+            const remaining = conversations.filter((item) => item.session_id !== sessionId)
+            if (remaining.length === 0) {
+                const created = await createChatSession()
+                setConversations([{ ...created, messages: [], loaded: true }])
+                setActiveConversationId(created.session_id)
+                return
+            }
+            const sorted = sortConversations(remaining)
+            setConversations(sorted)
+            if (sessionId === activeConversationId) {
+                setActiveConversationId(sorted[0].session_id)
+                await loadConversation(sorted[0].session_id)
+            }
+        } catch (err: any) {
+            message.error(err?.message || '删除会话失败')
+        }
+    }
+
+    async function handleSend() {
+        if (!activeConversation) return
+        const query = inputValue.trim()
+        if (!query || streamingSessionId) return
+
+        const now = Date.now()
+        const requestId = `req_${now}_${Math.random().toString(36).slice(2, 8)}`
+        const tempUserId = `temp_user_${requestId}`
+        const tempAssistantId = `temp_assistant_${requestId}`
+        const optimisticMessages: ChatMessage[] = [
+            ...currentMessages,
+            { id: tempUserId, role: 'user', content: query, timestamp: now, status: 'completed' },
+            { id: tempAssistantId, role: 'assistant', content: '', timestamp: now + 1, status: 'streaming' },
+        ]
+
+        updateConversation(activeConversation.session_id, (item) => ({
+            ...item,
+            messages: optimisticMessages,
+            loaded: true,
+            preview: query,
+            updated_at: new Date(now).toISOString(),
+            message_count: item.message_count + 2,
+            title: item.title || query.slice(0, 28),
+        }))
+        setDrafts((prev) => ({ ...prev, [activeConversation.session_id]: '' }))
+        setStreamingSessionId(activeConversation.session_id)
 
         try {
-            const imported = await importDocument(file)
-            setDocId(imported.doc_id)
-            setIndexStatus('正在建立检索索引...')
-            await indexDocument(imported.doc_id)
-            const status = await getDocumentStatus(imported.doc_id)
-            setIndexStatus(`已接入《${status.title}》 · ${status.chunks} 个分块`)
-            message.success(`文档《${status.title}》已导入并完成索引`)
+            await chatSessionMessageStream(
+                activeConversation.session_id,
+                { query, request_id: requestId },
+                {
+                    onMetadata: (payload) => {
+                        if (payload.session) {
+                            updateConversation(activeConversation.session_id, (item) => mergeSummary(item, payload.session!))
+                        }
+                    },
+                    onToken: (token) => {
+                        updateConversation(activeConversation.session_id, (item) => ({
+                            ...item,
+                            updated_at: new Date().toISOString(),
+                            messages: item.messages.map((messageItem) =>
+                                messageItem.id === tempAssistantId
+                                    ? { ...messageItem, content: messageItem.content + token }
+                                    : messageItem
+                            ),
+                        }))
+                    },
+                    onDone: (payload) => {
+                        updateConversation(activeConversation.session_id, (item) => ({
+                            ...mergeSummary(item, payload.session || item),
+                            messages: item.messages.map((messageItem) =>
+                                messageItem.id === tempAssistantId
+                                    ? { ...messageItem, citations: payload.citations, status: 'completed' }
+                                    : messageItem
+                            ),
+                            loaded: true,
+                        }))
+                    },
+                    onError: (errMsg) => {
+                        updateConversation(activeConversation.session_id, (item) => ({
+                            ...item,
+                            updated_at: new Date().toISOString(),
+                            messages: item.messages.map((messageItem) =>
+                                messageItem.id === tempAssistantId
+                                    ? {
+                                        ...messageItem,
+                                        status: 'error',
+                                        content: messageItem.content || `生成失败：${errMsg}`,
+                                    }
+                                    : messageItem
+                            ),
+                        }))
+                    },
+                }
+            )
+            await loadConversation(activeConversation.session_id, true)
         } catch (err: any) {
-            const detail = err?.message || '文档处理失败'
-            setIndexStatus(`处理失败：${detail}`)
-            message.error(detail)
+            updateConversation(activeConversation.session_id, (item) => ({
+                ...item,
+                updated_at: new Date().toISOString(),
+                messages: item.messages.map((messageItem) =>
+                    messageItem.id === tempAssistantId
+                        ? { ...messageItem, status: 'error', content: `请求失败：${err?.message || '未知错误'}` }
+                        : messageItem
+                ),
+            }))
         } finally {
-            setIndexing(false)
+            setStreamingSessionId('')
         }
+    }
 
-        return false
-    }, [])
-
-    const handleViewCitation = useCallback(async (citationId: string) => {
+    async function handleViewCitation(citationId: string) {
         setCitationDrawerOpen(true)
         setViewingCitation(null)
         setViewingCitationLoading(true)
-
         try {
-            const data = await getCitationView(citationId)
-            setViewingCitation(data)
+            setViewingCitation(await getCitationView(citationId))
         } catch (err: any) {
             message.error(`查看引用失败：${err?.message || '未知错误'}`)
         } finally {
             setViewingCitationLoading(false)
         }
-    }, [])
+    }
 
-    const handleClearChat = useCallback(() => {
-        setMessages([])
-        setSessionId('')
-    }, [])
-
-    const highlightPieces = useMemo(() => toHighlightPieces(viewingCitation), [viewingCitation])
-    const statusSummary = indexing
-        ? '正在接入资料并重建索引。'
-        : indexStatus || (docId ? '文档已接入，可继续追问并查看引用。' : '先上传资料，再发起问题。')
-    const activeDocumentLabel = docId ? `${docId.slice(0, 8)}...` : '未接入'
+    async function handleOpenCitationOriginal(citation: CitationItem) {
+        try {
+            const target = await getCitationOpenTarget(citation.citation_id)
+            window.open(resolveOpenTargetUrl(target.url), '_blank', 'noopener,noreferrer')
+        } catch (err: any) {
+            message.error(`打开原文失败：${err?.message || '未知错误'}`)
+        }
+    }
 
     return (
         <div className="chat-page">
             <div className="chat-shell">
-                <header className="chat-header">
-                    <div className="chat-brand">
-                        <div className="chat-brand-mark">
-                            <FileTextOutlined style={{ fontSize: 24 }} />
+                <aside className="chat-sidebar">
+                    <div className="chat-sidebar-intro">
+                        <span className="chat-sidebar-kicker">LEGAL DESK</span>
+                        <div className="chat-sidebar-heading">
+                            <h2 className="chat-sidebar-title">法律咨询工作台</h2>
+                            <p className="chat-sidebar-copy">会话、历史消息和上下文摘要已切换为服务端管理。</p>
                         </div>
-                        <div className="chat-header-copy">
-                            <div className="chat-header-kicker">Labor Dispute Dossier</div>
-                            <h1 className="chat-header-title">法律辅助咨询工作台</h1>
-                            <p className="chat-header-subtitle">
-                                面向劳动争议场景的检索增强问答界面。你可以上传法规、裁判文书或业务资料，系统将返回带引用依据的答案。
-                            </p>
+                        <div className="chat-sidebar-stats">
+                            <span>{conversations.length} 个会话</span>
+                            <span>{currentMessages.length} 条消息</span>
                         </div>
                     </div>
-                    <div className="chat-toolbar">
-                        <div className="chat-status-pill">
-                            <DatabaseOutlined />
-                            {docId ? '已接入资料' : '等待导入文档'}
-                        </div>
-                        <Upload
-                            accept=".pdf,.html,.htm,.txt,.docx"
-                            showUploadList={false}
-                            beforeUpload={(file) => {
-                                void handleFileUpload(file)
-                                return false
-                            }}
-                            disabled={indexing}
-                        >
-                            <Button icon={<PaperClipOutlined />} loading={indexing}>
-                                {indexing ? '处理中' : '上传文档'}
-                            </Button>
-                        </Upload>
-                        <Tooltip title="清空当前对话">
-                            <Button icon={<ClearOutlined />} onClick={handleClearChat} disabled={streaming} />
-                        </Tooltip>
+
+                    <div className="chat-sidebar-top">
+                        <button type="button" className="chat-new-thread" onClick={() => void handleNewConversation()}>
+                            <PlusOutlined />
+                            新建对话
+                        </button>
                     </div>
-                </header>
 
-                <div className="chat-stage">
-                    <aside className="chat-sidebar">
-                        <section className="dossier-card">
-                            <p className="dossier-eyebrow">Case Board</p>
-                            <h2 className="dossier-title">证据先行，答案可回溯。</h2>
-                            <p className="dossier-copy">
-                                当前界面把法律问答包装成一份可核对的案卷。先导入资料，再逐步追问，最后打开引用核对命中文本。
+                    <div className="chat-session-list">
+                        {conversations.map((conversation) => (
+                            <div key={conversation.session_id} className="chat-session-row">
+                                <button
+                                    type="button"
+                                    className={`chat-session-item${conversation.session_id === activeConversationId ? ' active' : ''}`}
+                                    onClick={() => void handleSelectConversation(conversation.session_id)}
+                                >
+                                    <span className="chat-session-title">{conversation.title}</span>
+                                    <span className="chat-session-preview">{getConversationPreview(conversation)}</span>
+                                    <span className="chat-session-time">{formatConversationTime(conversation.updated_at)}</span>
+                                </button>
+                                {conversations.length > 1 ? (
+                                    <Tooltip title="删除对话">
+                                        <button
+                                            type="button"
+                                            className="chat-session-delete"
+                                            onClick={() => void handleDeleteConversation(conversation.session_id)}
+                                            aria-label="删除对话"
+                                        >
+                                            <DeleteOutlined />
+                                        </button>
+                                    </Tooltip>
+                                ) : null}
+                            </div>
+                        ))}
+                    </div>
+                </aside>
+
+                <section className="chat-main">
+                    <header className="chat-main-header">
+                        <div className="chat-main-heading">
+                            <span className="chat-main-kicker">{conversationStateLabel}</span>
+                            <h1 className="chat-main-title">{activeConversation?.title || '加载中'}</h1>
+                            <p className="chat-main-meta">
+                                {bootstrapping
+                                    ? '正在同步服务端会话'
+                                    : currentMessages.length > 0
+                                        ? `${currentMessages.length} 条消息 · ${citationCount} 条引用`
+                                        : '从服务端新建会话开始，消息和上下文均持久化到数据库'}
                             </p>
-                            <div className="dossier-grid">
-                                <div className="dossier-stat">
-                                    <span className="dossier-stat-label">当前文档</span>
-                                    <span className="dossier-stat-value">{activeDocumentLabel}</span>
+                        </div>
+                        <div className="chat-main-actions">
+                            <span className="chat-main-hint">{streaming ? '正在生成回答...' : 'Enter 发送 · Shift + Enter 换行'}</span>
+                            <Link href="/knowledge" className="chat-knowledge-link">
+                                <DatabaseOutlined />
+                                知识库
+                            </Link>
+                        </div>
+                    </header>
+
+                    <main className="chat-messages">
+                        <div className="chat-thread">
+                            {bootstrapping ? (
+                                <div style={{ padding: 48, textAlign: 'center' }}>
+                                    <Spin />
                                 </div>
-                                <div className="dossier-stat">
-                                    <span className="dossier-stat-label">会话状态</span>
-                                    <span className="dossier-stat-value">{streaming ? '生成中' : '待提问'}</span>
-                                </div>
-                            </div>
-                        </section>
-
-                        <section className="dossier-card">
-                            <p className="dossier-eyebrow">Workflow</p>
-                            <ul className="dossier-list">
-                                {WORKFLOW_NOTES.map((note) => (
-                                    <li key={note}>{note}</li>
-                                ))}
-                            </ul>
-                        </section>
-
-                        <section className="dossier-card">
-                            <p className="dossier-eyebrow">Quick Prompts</p>
-                            <div className="prompt-grid">
-                                {QUICK_PROMPTS.map((prompt) => (
-                                    <button
-                                        key={prompt}
-                                        type="button"
-                                        className="prompt-chip"
-                                        onClick={() => setInputValue(prompt)}
-                                    >
-                                        {prompt}
-                                    </button>
-                                ))}
-                            </div>
-                        </section>
-                    </aside>
-
-                    <section className="chat-main">
-                        <main className="chat-messages">
-                            <div className="chat-thread">
-                                {messages.length === 0 && (
-                                    <section className="chat-welcome">
-                                        <div className="chat-welcome-top">
-                                            <div>
-                                                <div className="chat-welcome-icon">
-                                                    <SafetyCertificateOutlined />
-                                                </div>
-                                                <h2 className="chat-welcome-title">把每一次回答都当作可复核的案卷记录。</h2>
-                                                <p className="chat-welcome-copy">
-                                                    上传法律文本后，系统会通过混合检索与重排序生成回答，并在每个结论后附上命中的引用来源，方便你快速核对依据。
-                                                </p>
-                                            </div>
-                                            <div className="chat-welcome-disclaimer">
-                                                <InfoCircleOutlined />
-                                                仅用于学习、整理与辅助检索，不构成正式法律意见。
-                                            </div>
-                                        </div>
-                                        <div className="chat-welcome-panels">
-                                            <div className="chat-welcome-panel">
-                                                <h3>建议提问方式</h3>
-                                                <p>用事实加问题的格式输入，例如“公司连续两个月拖欠工资，我想申请仲裁，需要准备哪些证据？”</p>
-                                            </div>
-                                            <div className="chat-welcome-panel">
-                                                <h3>推荐操作顺序</h3>
-                                                <div className="chat-welcome-hints">
-                                                    {QUICK_PROMPTS.map((prompt) => (
-                                                        <button
-                                                            key={prompt}
-                                                            type="button"
-                                                            className="chat-hint"
-                                                            onClick={() => setInputValue(prompt)}
-                                                        >
-                                                            {prompt}
-                                                        </button>
-                                                    ))}
-                                                </div>
-                                            </div>
-                                        </div>
-                                    </section>
-                                )}
-
-                                {messages.map((msg) => (
-                                    <div key={msg.id} className={`chat-bubble-row ${msg.role}`}>
-                                        <div className="chat-message-stack">
-                                            <div className="chat-message-meta">
-                                                <span className="chat-message-role">
-                                                    <FileTextOutlined />
-                                                    {msg.role === 'assistant' ? '分析答复' : '提问记录'}
-                                                </span>
-                                                <span className="chat-message-time">{formatMessageTime(msg.timestamp)}</span>
-                                            </div>
-                                            <div className={`chat-bubble ${msg.role}`}>
-                                                {msg.role === 'assistant' ? (
-                                                    <>
-                                                        {msg.content ? (
-                                                            <div
-                                                                className="chat-markdown"
-                                                                dangerouslySetInnerHTML={{ __html: md.render(msg.content) }}
-                                                            />
-                                                        ) : (
-                                                            <Spin size="small" />
-                                                        )}
-                                                        {msg.citations && msg.citations.length > 0 && (
-                                                            <div className="chat-citations">
-                                                                <div className="chat-citations-header">
-                                                                    <FileTextOutlined />
-                                                                    引用来源 {msg.citations.length} 条
-                                                                </div>
-                                                                {msg.citations.map((citation, index) => (
-                                                                    <div key={citation.citation_id} className="chat-citation-item">
-                                                                        <div className="chat-citation-idx">[{index + 1}]</div>
-                                                                        <div className="chat-citation-body">
-                                                                            <div className="chat-citation-title">{citation.source.title}</div>
-                                                                            <div className="chat-citation-snippet">{citation.snippet}</div>
-                                                                            <div className="chat-citation-tags">
-                                                                                {citation.location.section && (
-                                                                                    <Tag>{citation.location.section}</Tag>
-                                                                                )}
-                                                                                {citation.location.article_no && (
-                                                                                    <Tag>{citation.location.article_no}</Tag>
-                                                                                )}
-                                                                            </div>
-                                                                        </div>
-                                                                        <Tooltip title="查看原文命中位置">
-                                                                            <Button
-                                                                                type="text"
-                                                                                icon={<HighlightOutlined />}
-                                                                                onClick={() => handleViewCitation(citation.citation_id)}
-                                                                            />
+                            ) : currentMessages.length === 0 ? (
+                                <section className="chat-empty">
+                                    <span className="chat-empty-kicker">START WITH FACTS</span>
+                                    <h2 className="chat-empty-title">开始新对话</h2>
+                                    <p className="chat-empty-copy">描述时间、地区、劳动关系和你的目标，服务端会话会自动记录历史与上下文。</p>
+                                    <div className="chat-empty-prompts">
+                                        {QUICK_PROMPTS.map((prompt) => (
+                                            <button
+                                                key={prompt}
+                                                type="button"
+                                                className="chat-empty-prompt"
+                                                onClick={() => setDrafts((prev) => ({ ...prev, [activeConversationId]: prompt }))}
+                                            >
+                                                {prompt}
+                                            </button>
+                                        ))}
+                                    </div>
+                                </section>
+                            ) : (
+                                currentMessages.map((msg) => (
+                                    <div key={msg.id} className={`chat-message-row ${msg.role}`}>
+                                        <div className={`chat-bubble ${msg.role}`}>
+                                            {msg.role === 'assistant' ? (
+                                                <>
+                                                    {msg.content ? (
+                                                        <div className="chat-markdown" dangerouslySetInnerHTML={{ __html: md.render(msg.content) }} />
+                                                    ) : (
+                                                        <Spin size="small" />
+                                                    )}
+                                                    {msg.citations?.length ? (
+                                                        <div className="chat-citations">
+                                                            {msg.citations.map((citation) => (
+                                                                <div key={citation.citation_id} className="chat-citation-item">
+                                                                    <div className="chat-citation-body">
+                                                                        <div className="chat-citation-title">{citation.source.title}</div>
+                                                                        <div className="chat-citation-snippet">{citation.snippet}</div>
+                                                                    </div>
+                                                                    <div className="chat-citation-actions">
+                                                                        <Tooltip title="在新标签页打开原文定位">
+                                                                            <button
+                                                                                type="button"
+                                                                                className="chat-citation-action primary"
+                                                                                onClick={() => void handleOpenCitationOriginal(citation)}
+                                                                            >
+                                                                                <ExportOutlined />
+                                                                                <span>打开原文</span>
+                                                                            </button>
+                                                                        </Tooltip>
+                                                                        <Tooltip title="查看当前摘录定位">
+                                                                            <button
+                                                                                type="button"
+                                                                                className="chat-citation-action secondary"
+                                                                                onClick={() => void handleViewCitation(citation.citation_id)}
+                                                                            >
+                                                                                <HighlightOutlined />
+                                                                                <span>查看摘录</span>
+                                                                            </button>
                                                                         </Tooltip>
                                                                     </div>
-                                                                ))}
-                                                                <Collapse
-                                                                    ghost
-                                                                    className="chat-debug-panel"
-                                                                    items={[
-                                                                        {
-                                                                            key: 'debug',
-                                                                            label: (
-                                                                                <span style={{ fontSize: 12, color: '#70675d' }}>
-                                                                                    <BugOutlined style={{ marginRight: 6 }} />
-                                                                                    检索评分细节
-                                                                                </span>
-                                                                            ),
-                                                                            children: (
-                                                                                <div>
-                                                                                    {msg.citations.map((citation, index) => (
-                                                                                        <div key={citation.citation_id} className="chat-debug-row">
-                                                                                            <strong>[{index + 1}]</strong>{' '}
-                                                                                            BM25={citation.scores.bm25.toFixed(3)}{' '}
-                                                                                            Vector={citation.scores.vector.toFixed(3)}{' '}
-                                                                                            RRF={citation.scores.rrf.toFixed(5)}{' '}
-                                                                                            Rerank={citation.scores.rerank.toFixed(3)}
-                                                                                        </div>
-                                                                                    ))}
-                                                                                </div>
-                                                                            ),
-                                                                        },
-                                                                    ]}
-                                                                />
-                                                            </div>
-                                                        )}
-                                                    </>
-                                                ) : (
-                                                    <div className="chat-user-text">{msg.content}</div>
-                                                )}
-                                            </div>
+                                                                </div>
+                                                            ))}
+                                                        </div>
+                                                    ) : null}
+                                                </>
+                                            ) : (
+                                                <div className="chat-user-text">{msg.content}</div>
+                                            )}
                                         </div>
                                     </div>
-                                ))}
-                                <div ref={bottomRef} />
-                            </div>
-                        </main>
+                                ))
+                            )}
+                            <div ref={bottomRef} />
+                        </div>
+                    </main>
 
-                        <footer className="chat-input-area">
-                            <div className="chat-input-panel">
-                                <div className="chat-input-label">
-                                    <span className="chat-input-kicker">Ask With Evidence</span>
-                                    <span className="chat-input-status">{statusSummary}</span>
-                                </div>
-                                <div className="chat-input-inner">
-                                    <TextArea
-                                        value={inputValue}
-                                        onChange={(e) => setInputValue(e.target.value)}
-                                        onPressEnter={(e) => {
-                                            if (!e.shiftKey) {
-                                                e.preventDefault()
-                                                void handleSend()
-                                            }
-                                        }}
-                                        placeholder="输入劳动法相关问题，按 Enter 发送，Shift + Enter 换行。"
-                                        autoSize={{ minRows: 1, maxRows: 5 }}
-                                        disabled={streaming}
-                                        style={{ resize: 'none' }}
-                                    />
-                                    <Button
-                                        className="chat-send-btn"
-                                        type="primary"
-                                        shape="circle"
-                                        icon={<SendOutlined />}
-                                        onClick={() => void handleSend()}
-                                        disabled={!inputValue.trim() || streaming}
-                                        loading={streaming}
-                                    />
-                                </div>
+                    <footer className="chat-input-area">
+                        <div className="chat-input-panel">
+                            <div className="chat-input-inner">
+                                <TextArea
+                                    value={inputValue}
+                                    onChange={(e) => setDrafts((prev) => ({ ...prev, [activeConversationId]: e.target.value }))}
+                                    onPressEnter={(e) => {
+                                        if (!e.shiftKey) {
+                                            e.preventDefault()
+                                            void handleSend()
+                                        }
+                                    }}
+                                    placeholder="输入问题，消息与上下文会持久化到数据库"
+                                    autoSize={{ minRows: 1, maxRows: 8 }}
+                                    disabled={!activeConversationId || streaming}
+                                    style={{ resize: 'none' }}
+                                />
+                                <button
+                                    type="button"
+                                    className="chat-send-btn"
+                                    onClick={() => void handleSend()}
+                                    disabled={!inputValue.trim() || !activeConversationId || streaming}
+                                    aria-label="发送消息"
+                                >
+                                    <SendOutlined />
+                                </button>
                             </div>
-                            <div className="chat-input-disclaimer">
-                                <InfoCircleOutlined />
-                                你的问题和引用命中会保留在当前会话中，清空对话不会删除已上传文档索引。
-                            </div>
-                        </footer>
-                    </section>
-                </div>
+                        </div>
+                    </footer>
+                </section>
             </div>
 
             <Drawer
-                title="引用原文查看"
+                title="引用原文"
                 placement="right"
                 width={560}
                 open={citationDrawerOpen}
@@ -520,17 +628,15 @@ export default function ChatPage() {
                             <h3 className="citation-meta-title">引用定位</h3>
                             <p className="citation-meta-copy">文档 ID：{viewingCitation?.doc_id || '-'}</p>
                         </div>
-                        {viewingCitation?.highlight.method === 'whole_chunk' && (
+                        {viewingCitation?.highlight.method === 'whole_chunk' ? (
                             <div className="citation-fallback-notice">
                                 <InfoCircleOutlined style={{ marginRight: 6 }} />
-                                原文排版与切块边界存在偏差，当前以整段高亮方式展示命中内容。
+                                当前以整段高亮方式展示命中内容。
                             </div>
-                        )}
+                        ) : null}
                         <div className="citation-context">
                             <span>{highlightPieces.before}</span>
-                            <mark ref={highlightRef} className="citation-highlight">
-                                {highlightPieces.hit}
-                            </mark>
+                            <mark ref={highlightRef} className="citation-highlight">{highlightPieces.hit}</mark>
                             <span>{highlightPieces.after}</span>
                         </div>
                     </div>

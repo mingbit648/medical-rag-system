@@ -42,6 +42,7 @@ export interface CitationItem {
         url_or_file: string
     }
     location: {
+        page?: number | null
         section?: string | null
         article_no?: string | null
     }
@@ -58,14 +59,49 @@ export interface ChatCompletionData {
     session_id: string
     answer_md: string
     citations: CitationItem[]
+    user_message_id?: string
+    assistant_message_id?: string
+    session?: ChatSessionSummary
 }
 
 export interface ChatHistoryMessage {
     msg_id: string
+    message_id?: string
     session_id: string
+    session_seq?: number
     role: 'user' | 'assistant' | 'system' | string
     content: string
+    status?: 'streaming' | 'completed' | 'error' | string
+    message_type?: string
     created_at: string
+    updated_at?: string
+    completed_at?: string | null
+    citations?: CitationItem[]
+    meta_json?: Record<string, any>
+}
+
+export interface ChatSessionSummary {
+    session_id: string
+    title: string
+    status: 'active' | 'archived' | 'deleted' | string
+    preview: string
+    message_count: number
+    created_at: string
+    updated_at: string
+    last_active_at: string
+    active_summary_id?: string | null
+}
+
+export interface ChatSessionDetail {
+    session: ChatSessionSummary
+    messages: ChatHistoryMessage[]
+    active_summary?: {
+        snapshot_id: string
+        from_seq: number
+        to_seq: number
+        summary_text: string
+        meta_json?: Record<string, any>
+    } | null
 }
 
 export interface CitationViewData {
@@ -82,8 +118,48 @@ export interface CitationViewData {
     fallback: any
 }
 
+export interface CitationOpenTarget {
+    doc_id: string
+    title: string
+    doc_type: string
+    target_kind: 'pdf' | 'text_viewer'
+    url: string
+    page?: number | null
+    segment_label?: string | null
+    download_url?: string | null
+    viewer_ready: boolean
+}
+
+export interface ViewerBlock {
+    index: number
+    text: string
+    start: number
+    end: number
+}
+
+export interface DocumentViewerContent {
+    doc_id: string
+    title: string
+    doc_type: string
+    viewer_mode: string
+    download_url: string
+    blocks: ViewerBlock[]
+    highlight: {
+        start: number
+        end: number
+        block_start: number
+        block_end: number
+    }
+    citation_meta: {
+        section?: string | null
+        article_no?: string | null
+        snippet: string
+    }
+}
+
 export interface ChatCompletionRequest {
     session_id?: string
+    request_id?: string
     query: string
     topn?: {
         bm25: number
@@ -108,7 +184,21 @@ export interface ChatCompletionRequest {
 
 export interface StreamHandlers {
     onToken?: (token: string) => void
-    onDone?: (payload: { session_id: string; citations: CitationItem[]; trace_id: string }) => void
+    onMetadata?: (payload: {
+        session_id: string
+        user_message_id?: string
+        assistant_message_id?: string
+        citations: CitationItem[]
+        session?: ChatSessionSummary
+    }) => void
+    onDone?: (payload: {
+        session_id: string
+        user_message_id?: string
+        assistant_message_id?: string
+        citations: CitationItem[]
+        session?: ChatSessionSummary
+        trace_id: string
+    }) => void
     onError?: (message: string) => void
 }
 
@@ -224,7 +314,9 @@ export async function chatCompletionStream(request: ChatCompletionRequest, handl
             const event = eventLine.replace('event:', '').trim()
             const data = dataLine.replace('data:', '').trim()
 
-            if (event === 'token') {
+            if (event === 'metadata') {
+                handlers.onMetadata?.(JSON.parse(data))
+            } else if (event === 'token') {
                 try {
                     const parsedToken = JSON.parse(data)
                     handlers.onToken?.(parsedToken)
@@ -258,12 +350,136 @@ export async function getCitationView(citationId: string, contextBefore = 400, c
     return unwrap(envelope)
 }
 
+export async function getCitationOpenTarget(citationId: string): Promise<CitationOpenTarget> {
+    const envelope = await apiClient.get<ApiEnvelope<CitationOpenTarget>>(`/api/v1/citations/${citationId}/open-target`)
+    return unwrap(envelope)
+}
+
+export async function getDocumentViewerContent(docId: string, citationId: string): Promise<DocumentViewerContent> {
+    const envelope = await apiClient.get<ApiEnvelope<DocumentViewerContent>>(`/api/v1/docs/${docId}/viewer-content`, {
+        citation_id: citationId,
+    })
+    return unwrap(envelope)
+}
+
 export async function getChatHistory(sessionId: string, limit = 50): Promise<{ session_id: string; messages: ChatHistoryMessage[] }> {
     const envelope = await apiClient.get<ApiEnvelope<{ session_id: string; messages: ChatHistoryMessage[] }>>(
         `/api/v1/chat/history/${sessionId}`,
         { limit }
     )
     return unwrap(envelope)
+}
+
+export async function createChatSession(title?: string): Promise<ChatSessionSummary> {
+    const envelope = await apiClient.post<ApiEnvelope<ChatSessionSummary>>('/api/v1/chat/sessions', { title })
+    return unwrap(envelope)
+}
+
+export async function listChatSessions(limit = 20, status: 'active' | 'archived' | 'all' = 'active'): Promise<{ items: ChatSessionSummary[] }> {
+    const envelope = await apiClient.get<ApiEnvelope<{ items: ChatSessionSummary[] }>>('/api/v1/chat/sessions', { limit, status })
+    return unwrap(envelope)
+}
+
+export async function getChatSessionDetail(sessionId: string, messageLimit = 50): Promise<ChatSessionDetail> {
+    const envelope = await apiClient.get<ApiEnvelope<ChatSessionDetail>>(`/api/v1/chat/sessions/${sessionId}`, {
+        message_limit: messageLimit,
+    })
+    return unwrap(envelope)
+}
+
+export async function getChatSessionMessages(
+    sessionId: string,
+    limit = 50,
+    beforeSeq?: number
+): Promise<{ session_id: string; messages: ChatHistoryMessage[] }> {
+    const envelope = await apiClient.get<ApiEnvelope<{ session_id: string; messages: ChatHistoryMessage[] }>>(
+        `/api/v1/chat/sessions/${sessionId}/messages`,
+        { limit, before_seq: beforeSeq }
+    )
+    return unwrap(envelope)
+}
+
+export async function updateChatSession(
+    sessionId: string,
+    payload: { title?: string; status?: 'active' | 'archived' | 'deleted' }
+): Promise<ChatSessionSummary> {
+    const envelope = await apiClient.patch<ApiEnvelope<ChatSessionSummary>>(`/api/v1/chat/sessions/${sessionId}`, payload)
+    return unwrap(envelope)
+}
+
+export async function deleteChatSession(sessionId: string): Promise<{ session_id: string; deleted: boolean }> {
+    const envelope = await apiClient.delete<ApiEnvelope<{ session_id: string; deleted: boolean }>>(`/api/v1/chat/sessions/${sessionId}`)
+    return unwrap(envelope)
+}
+
+export async function chatSessionMessage(
+    sessionId: string,
+    request: Omit<ChatCompletionRequest, 'session_id'>
+): Promise<ChatCompletionData> {
+    const envelope = await apiClient.post<ApiEnvelope<ChatCompletionData>>(
+        `/api/v1/chat/sessions/${sessionId}/messages`,
+        withDefaults({ ...request, session_id: sessionId })
+    )
+    return unwrap(envelope)
+}
+
+export async function chatSessionMessageStream(
+    sessionId: string,
+    request: Omit<ChatCompletionRequest, 'session_id'>,
+    handlers: StreamHandlers = {}
+): Promise<void> {
+    const response = await fetch(`${apiClient['baseUrl']}/api/v1/chat/sessions/${sessionId}/messages:stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(withDefaults({ ...request, session_id: sessionId })),
+    })
+
+    if (!response.ok || !response.body) {
+        const text = await response.text()
+        throw new Error(text || '流式请求失败')
+    }
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+
+    while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+
+        const events = buffer.split('\n\n')
+        buffer = events.pop() || ''
+
+        for (const block of events) {
+            const lines = block.split('\n')
+            const eventLine = lines.find((line) => line.startsWith('event:'))
+            const dataLine = lines.find((line) => line.startsWith('data:'))
+            if (!eventLine || !dataLine) continue
+
+            const event = eventLine.replace('event:', '').trim()
+            const data = dataLine.replace('data:', '').trim()
+
+            if (event === 'metadata') {
+                handlers.onMetadata?.(JSON.parse(data))
+            } else if (event === 'token') {
+                try {
+                    handlers.onToken?.(JSON.parse(data))
+                } catch {
+                    handlers.onToken?.(data)
+                }
+            } else if (event === 'done') {
+                handlers.onDone?.(JSON.parse(data))
+            } else if (event === 'error') {
+                try {
+                    const payload = JSON.parse(data)
+                    handlers.onError?.(payload.message || 'stream error')
+                } catch {
+                    handlers.onError?.(data || 'stream error')
+                }
+            }
+        }
+    }
 }
 
 export async function runExperiment(cases: ExperimentCaseInput[]): Promise<ExperimentRunResult> {
@@ -278,5 +494,15 @@ export async function runExperiment(cases: ExperimentCaseInput[]): Promise<Exper
 
 export async function listRuns(limit = 20): Promise<{ items: Array<Record<string, any>> }> {
     const envelope = await apiClient.get<ApiEnvelope<{ items: Array<Record<string, any>> }>>('/api/v1/experiments/runs', { limit })
+    return unwrap(envelope)
+}
+
+export async function listDocuments(): Promise<{ items: DocStatusResult[] }> {
+    const envelope = await apiClient.get<ApiEnvelope<{ items: DocStatusResult[] }>>('/api/v1/docs')
+    return unwrap(envelope)
+}
+
+export async function deleteDocument(docId: string): Promise<{ doc_id: string; deleted: boolean }> {
+    const envelope = await apiClient.delete<ApiEnvelope<{ doc_id: string; deleted: boolean }>>(`/api/v1/docs/${docId}`)
     return unwrap(envelope)
 }

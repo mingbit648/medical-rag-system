@@ -1,13 +1,32 @@
-// API 客户端 — 法律辅助咨询 RAG 系统
-
 // API 客户端配置
 // 生产环境使用相对路径，由 Nginx 代理转发
-// 开发环境使用绝对路径直连后端
+// 开发环境使用绝对地址直连后端
 
 const API_BASE_URL =
     process.env.NEXT_PUBLIC_API_BASE_URL !== undefined
         ? process.env.NEXT_PUBLIC_API_BASE_URL
         : (process.env.NODE_ENV === 'development' ? 'http://localhost:8002' : '')
+
+export function resolveApiUrl(endpoint: string): string {
+    if (!endpoint) return endpoint
+    if (/^https?:\/\//.test(endpoint)) return endpoint
+    if (!endpoint.startsWith('/')) return endpoint
+    return `${API_BASE_URL}${endpoint}`
+}
+
+function buildError(response: Response, errorData: any): Error {
+    const detail = errorData?.detail
+    const message =
+        typeof detail === 'string'
+            ? detail
+            : detail?.message || errorData?.message || `请求失败: ${response.statusText}`
+    const error = new Error(message)
+    ; (error as any).status = response.status
+    if (detail && typeof detail === 'object' && typeof detail.code === 'string') {
+        ; (error as any).code = detail.code
+    }
+    return error
+}
 
 export class ApiClient {
     private baseUrl: string
@@ -36,9 +55,7 @@ export class ApiClient {
 
         if (!response.ok) {
             const errorData = await response.json().catch(() => ({}))
-            const error = new Error(errorData.detail || errorData.message || `请求失败: ${response.statusText}`)
-                ; (error as any).status = response.status
-            throw error
+            throw buildError(response, errorData)
         }
 
         if (response.status === 204) {
@@ -79,15 +96,19 @@ export class ApiClient {
         })
     }
 
+    async patch<T>(endpoint: string, data?: any): Promise<T> {
+        return this.request<T>(endpoint, {
+            method: 'PATCH',
+            body: data ? JSON.stringify(data) : undefined,
+        })
+    }
+
     async delete<T>(endpoint: string): Promise<T> {
         return this.request<T>(endpoint, {
             method: 'DELETE',
         })
     }
 
-    /**
-     * 流式请求（用于 SSE/流式响应）
-     */
     async stream(
         endpoint: string,
         data?: any,
@@ -112,9 +133,7 @@ export class ApiClient {
 
         if (!response.ok) {
             const errorData = await response.json().catch(() => ({}))
-            const error = new Error(errorData.detail || errorData.message || `请求失败: ${response.statusText}`)
-                ; (error as any).status = response.status
-            throw error
+            throw buildError(response, errorData)
         }
 
         if (!response.body) {

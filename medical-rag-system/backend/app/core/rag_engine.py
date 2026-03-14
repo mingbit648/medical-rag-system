@@ -14,8 +14,11 @@ LegalRagService — 法律辅助咨询 RAG 引擎入口 (facade)。
 """
 
 import logging
+import mimetypes
+import shutil
 import threading
 import uuid
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -24,6 +27,7 @@ from rank_bm25 import BM25Okapi
 
 from app.core.config import settings
 from app.repositories import PgRepository
+from app.services import SessionService
 
 from .text_utils import ChunkRecord, PRONOUN_REF_PATTERN, now_iso, tokenize
 from .embedder import EmbeddingService
@@ -47,6 +51,7 @@ class LegalRagService:
 
         # 数据库：使用 PostgreSQL
         self.repo = PgRepository(settings.DATABASE_URL)
+        self.session_service = SessionService(self.repo)
 
         self._lock = threading.RLock()
         self.chunk_lookup: Dict[str, ChunkRecord] = {}
@@ -70,6 +75,65 @@ class LegalRagService:
         self._cross_encoder_state: dict = {"model": None, "disabled": False}
 
         self._reload_index_cache()
+
+    def _data_root(self) -> Path:
+        return Path(settings.DATA_DIR)
+
+    def _resolve_doc_file_path(self, doc: Dict[str, Any]) -> Optional[Path]:
+        relative_path = (doc.get("file_path") or "").strip()
+        if not relative_path:
+            return None
+        path = Path(relative_path)
+        return path if path.is_absolute() else self._data_root() / path
+
+    def _ensure_original_viewable(self, doc: Dict[str, Any]) -> Path:
+        if doc.get("source_version") != 2 or not doc.get("has_original_file"):
+            raise ValueError("该文档需重新上传并重建索引后才能直达原文。")
+        file_path = self._resolve_doc_file_path(doc)
+        if file_path is None or not file_path.exists():
+            raise ValueError("原始文档文件不存在，请重新上传并重建索引。")
+        return file_path
+
+    @staticmethod
+    def _make_blocks_from_spans(text: str, spans: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        blocks: List[Dict[str, Any]] = []
+        for span in spans:
+            start = max(0, min(int(span.get("start", 0)), len(text)))
+            end = max(start, min(int(span.get("end", start)), len(text)))
+            blocks.append(
+                {
+                    "index": int(span.get("index") or span.get("page") or len(blocks) + 1),
+                    "text": text[start:end],
+                    "start": start,
+                    "end": end,
+                }
+            )
+        return blocks
+
+    @staticmethod
+    def _split_text_blocks(text: str) -> List[Dict[str, Any]]:
+        if not text:
+            return [{"index": 1, "text": "", "start": 0, "end": 0}]
+
+        blocks: List[Dict[str, Any]] = []
+        cursor = 0
+        block_index = 1
+        for chunk in text.split("\n\n"):
+            start = text.find(chunk, cursor)
+            if start < 0:
+                start = cursor
+            end = start + len(chunk)
+            blocks.append({"index": block_index, "text": chunk, "start": start, "end": end})
+            block_index += 1
+            cursor = end + 2
+        return blocks or [{"index": 1, "text": text, "start": 0, "end": len(text)}]
+
+    @staticmethod
+    def _locate_highlight_blocks(blocks: List[Dict[str, Any]], start_pos: int, end_pos: int) -> Dict[str, int]:
+        overlapping = [block for block in blocks if block["end"] > start_pos and block["start"] < end_pos]
+        if not overlapping:
+            return {"block_start": blocks[0]["index"], "block_end": blocks[0]["index"]}
+        return {"block_start": overlapping[0]["index"], "block_end": overlapping[-1]["index"]}
 
     # ─── ChromaDB 初始化 ──────────────────────────────────
     def _init_chroma(self) -> None:
@@ -117,6 +181,7 @@ class LegalRagService:
                     article_no=row.get("article_no"),
                     page_start=row.get("page_start"),
                     page_end=row.get("page_end"),
+                    locator_json=row.get("locator_json") or {},
                 )
                 self.chunk_lookup[chunk.chunk_id] = chunk
                 self.chunk_terms[chunk.chunk_id] = tokenize(chunk.chunk_text)
@@ -207,7 +272,14 @@ class LegalRagService:
             raise KeyError("文档不存在")
         c_size = chunk_size or self.default_chunk_size
         c_overlap = self.default_chunk_overlap if overlap is None else overlap
-        chunk_rows = chunk_text(doc["text"], c_size, c_overlap, doc_id)
+        chunk_rows = chunk_text(
+            doc["text"],
+            c_size,
+            c_overlap,
+            doc_id,
+            doc_type=doc["doc_type"],
+            document_meta=doc.get("meta_json") or {},
+        )
         self.repo.replace_chunks(doc_id, chunk_rows)
         self.repo.update_document_index_status(doc_id, parse_status="indexed", chunks=len(chunk_rows))
         self.bm25_enabled = bm25_enabled
@@ -234,28 +306,56 @@ class LegalRagService:
         return [{"doc_id": d["doc_id"], "title": d["title"], "doc_type": d["doc_type"],
                  "parse_status": d["parse_status"], "chunks": d.get("chunks", 0), "created_at": d["created_at"]} for d in docs]
 
+    def delete_document(self, doc_id: str) -> bool:
+        """删除文档及其关联数据，并重建索引缓存。"""
+        doc = self.repo.get_document(doc_id)
+        if doc is None:
+            raise KeyError("文档不存在")
+        file_path = self._resolve_doc_file_path(doc)
+        deleted = self.repo.delete_document(doc_id)
+        if deleted:
+            upload_dir = (self._data_root() / "uploads" / doc_id)
+            if upload_dir.exists():
+                shutil.rmtree(upload_dir, ignore_errors=True)
+            elif file_path and file_path.exists():
+                try:
+                    file_path.unlink()
+                except OSError:
+                    logger.warning("删除原始文件失败: %s", file_path)
+            self._reload_index_cache()
+        return deleted
+
     # ─── 检索 + 生成 ────────────────────────────────────
     def retrieve(self, query, bm25_topn=50, vector_topn=50, fusion_k=60,
                  rerank_topk=30, rerank_topm=8, save_citations=True,
-                 llm=None, history_messages=None, user_query_for_answer=None, generate_answer_flag=True):
+                 llm=None, history_messages=None, summary_text="",
+                 user_query_for_answer=None, generate_answer_flag=True,
+                 assistant_message_id=None):
         chunks = self._indexed_chunks()
-        if not chunks:
-            raise ValueError("尚无已建索引文档，请先导入并建立索引。")
         query_tokens = tokenize(query)
         if not query_tokens:
             raise ValueError("查询内容为空或不可解析。")
 
-        bm25_ranked = rank_bm25(query_tokens, bm25_topn, self.bm25_enabled, self.bm25_index, self.bm25_chunk_ids)
-        vector_ranked = rank_dense(query, vector_topn, self.vector_enabled, self.embedding_service,
-                                   self.vector_chunk_ids, self.vector_matrix, self.chroma_collection)
-        fused = rrf_fusion(bm25_ranked, vector_ranked, fusion_k)[:max(1, rerank_topk)]
-        reranked = rerank(query, query_tokens, fused, bm25_ranked, vector_ranked,
-                          self.chunk_lookup, self.chunk_terms, self._cross_encoder_state, self.cross_encoder_model_name)
+        if chunks:
+            bm25_ranked = rank_bm25(query_tokens, bm25_topn, self.bm25_enabled, self.bm25_index, self.bm25_chunk_ids)
+            vector_ranked = rank_dense(query, vector_topn, self.vector_enabled, self.embedding_service,
+                                       self.vector_chunk_ids, self.vector_matrix, self.chroma_collection)
+            fused = rrf_fusion(bm25_ranked, vector_ranked, fusion_k)[:max(1, rerank_topk)]
+            reranked = rerank(query, query_tokens, fused, bm25_ranked, vector_ranked,
+                              self.chunk_lookup, self.chunk_terms, self._cross_encoder_state, self.cross_encoder_model_name)
+        else:
+            bm25_ranked = []
+            vector_ranked = []
+            fused = []
+            reranked = []
                           
         # FR-15: 可引用性阈值过滤
         evidence = [hit for hit in reranked[:max(1, rerank_topm)] if hit.get("rerank", 0.0) > 0.05]
 
-        citations = [make_citation(self.repo, hit, persist=save_citations) for hit in evidence] if save_citations else []
+        citations = [
+            make_citation(self.repo, hit, persist=save_citations, message_id=assistant_message_id)
+            for hit in evidence
+        ] if save_citations else []
         answer = ""
         if generate_answer_flag:
             answer = generate_answer(
@@ -263,31 +363,40 @@ class LegalRagService:
                 citation_like=citations if save_citations else evidence,
                 llm=llm or {},
                 history_messages=history_messages or [],
+                summary_text=summary_text,
             )
         return {"answer_md": answer, "citations": citations,
                 "debug": {"bm25": bm25_ranked, "vector": vector_ranked, "fusion": fused, "rerank": reranked}}
 
     async def retrieve_stream(self, query, bm25_topn=50, vector_topn=50, fusion_k=60,
                  rerank_topk=30, rerank_topm=8, save_citations=True,
-                 llm=None, history_messages=None, user_query_for_answer=None):
+                 llm=None, history_messages=None, summary_text="",
+                 user_query_for_answer=None, assistant_message_id=None):
         chunks = self._indexed_chunks()
-        if not chunks:
-            raise ValueError("尚无已建索引文档，请先导入并建立索引。")
         query_tokens = tokenize(query)
         if not query_tokens:
             raise ValueError("查询内容为空或不可解析。")
 
-        bm25_ranked = rank_bm25(query_tokens, bm25_topn, self.bm25_enabled, self.bm25_index, self.bm25_chunk_ids)
-        vector_ranked = rank_dense(query, vector_topn, self.vector_enabled, self.embedding_service,
-                                   self.vector_chunk_ids, self.vector_matrix, self.chroma_collection)
-        fused = rrf_fusion(bm25_ranked, vector_ranked, fusion_k)[:max(1, rerank_topk)]
-        reranked = rerank(query, query_tokens, fused, bm25_ranked, vector_ranked,
-                          self.chunk_lookup, self.chunk_terms, self._cross_encoder_state, self.cross_encoder_model_name)
+        if chunks:
+            bm25_ranked = rank_bm25(query_tokens, bm25_topn, self.bm25_enabled, self.bm25_index, self.bm25_chunk_ids)
+            vector_ranked = rank_dense(query, vector_topn, self.vector_enabled, self.embedding_service,
+                                       self.vector_chunk_ids, self.vector_matrix, self.chroma_collection)
+            fused = rrf_fusion(bm25_ranked, vector_ranked, fusion_k)[:max(1, rerank_topk)]
+            reranked = rerank(query, query_tokens, fused, bm25_ranked, vector_ranked,
+                              self.chunk_lookup, self.chunk_terms, self._cross_encoder_state, self.cross_encoder_model_name)
+        else:
+            bm25_ranked = []
+            vector_ranked = []
+            fused = []
+            reranked = []
         
         # FR-15: 可引用性阈值过滤 (过滤掉 rerank_score <= 0.2 或相关度极低的切片)
         evidence = [hit for hit in reranked[:max(1, rerank_topm)] if hit.get("rerank", 0.0) > 0.05]
 
-        citations = [make_citation(self.repo, hit, persist=save_citations) for hit in evidence] if save_citations else []
+        citations = [
+            make_citation(self.repo, hit, persist=save_citations, message_id=assistant_message_id)
+            for hit in evidence
+        ] if save_citations else []
         
         # 产生第一条消息作为前置 metadata
         yield {"type": "metadata", "citations": citations, 
@@ -299,79 +408,133 @@ class LegalRagService:
             citation_like=citations if save_citations else evidence,
             llm=llm or {},
             history_messages=history_messages or [],
+            summary_text=summary_text,
         ):
             yield {"type": "chunk", "content": chunk}
 
 
-    def chat(self, session_id, query, topn, fusion, rerank, llm):
-        sid = session_id or f"s_{uuid.uuid4().hex[:12]}"
-        history = self.repo.list_messages(session_id=sid, limit=settings.HISTORY_WINDOW_MESSAGES)
-        retrieval_query = self._compose_retrieval_query(query, history)
-        result = self.retrieve(
-            query=retrieval_query,
-            bm25_topn=topn.get("bm25", settings.TOPN_BM25),
-            vector_topn=topn.get("vector", settings.TOPN_VECTOR),
-            fusion_k=fusion.get("k", settings.FUSION_K),
-            rerank_topk=rerank.get("topk", settings.RERANK_TOPK),
-            rerank_topm=rerank.get("topm", settings.RERANK_TOPM),
-            save_citations=True, llm=llm, history_messages=history,
-            user_query_for_answer=query, generate_answer_flag=True,
-        )
-        self.repo.append_message(f"msg_{uuid.uuid4().hex[:16]}", sid, "user", query, now_iso())
-        self.repo.append_message(f"msg_{uuid.uuid4().hex[:16]}", sid, "assistant", result["answer_md"], now_iso())
-        result["debug"]["retrieval_query"] = retrieval_query
-        return {"session_id": sid, "answer_md": result["answer_md"], "citations": result["citations"], "debug": result["debug"]}
+    def chat(self, session_id, query, topn, fusion, rerank, llm, request_id=None):
+        turn = self.session_service.start_turn(session_id=session_id, query=query, request_id=request_id)
+        try:
+            result = self.retrieve(
+                query=turn.retrieval_query,
+                bm25_topn=topn.get("bm25", settings.TOPN_BM25),
+                vector_topn=topn.get("vector", settings.TOPN_VECTOR),
+                fusion_k=fusion.get("k", settings.FUSION_K),
+                rerank_topk=rerank.get("topk", settings.RERANK_TOPK),
+                rerank_topm=rerank.get("topm", settings.RERANK_TOPM),
+                save_citations=True,
+                llm=llm,
+                history_messages=turn.prompt_context["recent_messages"],
+                summary_text=turn.prompt_context["summary_text"],
+                user_query_for_answer=query,
+                generate_answer_flag=True,
+                assistant_message_id=turn.assistant_message["msg_id"],
+            )
+            result["debug"]["retrieval_query"] = turn.retrieval_query
+            completion = self.session_service.complete_turn(
+                session_id=turn.session["session_id"],
+                assistant_message_id=turn.assistant_message["msg_id"],
+                answer_md=result["answer_md"],
+                citations=result["citations"],
+                debug=result["debug"],
+            )
+            return {
+                "session_id": turn.session["session_id"],
+                "user_message_id": turn.user_message["msg_id"],
+                "assistant_message_id": turn.assistant_message["msg_id"],
+                "answer_md": result["answer_md"],
+                "citations": result["citations"],
+                "debug": result["debug"],
+                "session": completion["session"],
+            }
+        except Exception as exc:
+            self.session_service.fail_turn(
+                session_id=turn.session["session_id"],
+                assistant_message_id=turn.assistant_message["msg_id"],
+                error_message=str(exc),
+            )
+            raise
 
-    async def chat_stream(self, session_id, query, topn, fusion, rerank, llm):
-        sid = session_id or f"s_{uuid.uuid4().hex[:12]}"
-        history = self.repo.list_messages(session_id=sid, limit=settings.HISTORY_WINDOW_MESSAGES)
-        retrieval_query = self._compose_retrieval_query(query, history)
-        
-        self.repo.append_message(f"msg_{uuid.uuid4().hex[:16]}", sid, "user", query, now_iso())
-        
-        full_answer = []
+    async def chat_stream(self, session_id, query, topn, fusion, rerank, llm, request_id=None):
+        turn = self.session_service.start_turn(session_id=session_id, query=query, request_id=request_id)
+        full_answer: List[str] = []
         citations = []
-        debug_info = {}
-        
-        async for item in self.retrieve_stream(
-            query=retrieval_query,
-            bm25_topn=topn.get("bm25", settings.TOPN_BM25),
-            vector_topn=topn.get("vector", settings.TOPN_VECTOR),
-            fusion_k=fusion.get("k", settings.FUSION_K),
-            rerank_topk=rerank.get("topk", settings.RERANK_TOPK),
-            rerank_topm=rerank.get("topm", settings.RERANK_TOPM),
-            save_citations=True, llm=llm, history_messages=history,
-            user_query_for_answer=query
-        ):
-            if getattr(item, "get", None) and item.get("type") == "metadata":
-                citations = item.get("citations", [])
-                debug_info = item.get("debug", {})
-                debug_info["retrieval_query"] = retrieval_query
-                yield {"type": "metadata", "session_id": sid, "citations": citations, "debug": debug_info}
-            elif getattr(item, "get", None) and item.get("type") == "chunk":
-                chunk_str = item.get("content", "")
-                full_answer.append(chunk_str)
-                yield {"type": "chunk", "content": chunk_str}
-                
-        # 保存完整答案
-        final_answer_md = "".join(full_answer)
-        self.repo.append_message(f"msg_{uuid.uuid4().hex[:16]}", sid, "assistant", final_answer_md, now_iso())
+        debug_info: Dict[str, Any] = {}
 
-    def _compose_retrieval_query(self, query, history):
-        if not settings.ENABLE_HISTORY_FOR_RETRIEVAL or not history:
-            return query
-        user_messages = [m.get("content", "") for m in history if m.get("role") == "user" and m.get("content")]
-        if not user_messages:
-            return query
-        previous = user_messages[-1].strip()
-        if not previous:
-            return query
-        if len(query) <= 20 or PRONOUN_REF_PATTERN.search(query):
-            return f"{previous}\n{query}"
-        return query
+        try:
+            async for item in self.retrieve_stream(
+                query=turn.retrieval_query,
+                bm25_topn=topn.get("bm25", settings.TOPN_BM25),
+                vector_topn=topn.get("vector", settings.TOPN_VECTOR),
+                fusion_k=fusion.get("k", settings.FUSION_K),
+                rerank_topk=rerank.get("topk", settings.RERANK_TOPK),
+                rerank_topm=rerank.get("topm", settings.RERANK_TOPM),
+                save_citations=True,
+                llm=llm,
+                history_messages=turn.prompt_context["recent_messages"],
+                summary_text=turn.prompt_context["summary_text"],
+                user_query_for_answer=query,
+                assistant_message_id=turn.assistant_message["msg_id"],
+            ):
+                if getattr(item, "get", None) and item.get("type") == "metadata":
+                    citations = item.get("citations", [])
+                    debug_info = item.get("debug", {})
+                    debug_info["retrieval_query"] = turn.retrieval_query
+                    yield {
+                        "type": "metadata",
+                        "session_id": turn.session["session_id"],
+                        "user_message_id": turn.user_message["msg_id"],
+                        "assistant_message_id": turn.assistant_message["msg_id"],
+                        "citations": citations,
+                        "debug": debug_info,
+                        "session": turn.session,
+                    }
+                elif getattr(item, "get", None) and item.get("type") == "chunk":
+                    chunk_str = item.get("content", "")
+                    full_answer.append(chunk_str)
+                    yield {"type": "chunk", "content": chunk_str}
+
+            final_answer_md = "".join(full_answer)
+            completion = self.session_service.complete_turn(
+                session_id=turn.session["session_id"],
+                assistant_message_id=turn.assistant_message["msg_id"],
+                answer_md=final_answer_md,
+                citations=citations,
+                debug=debug_info,
+            )
+            yield {
+                "type": "completed",
+                "session_id": turn.session["session_id"],
+                "assistant_message_id": turn.assistant_message["msg_id"],
+                "session": completion["session"],
+            }
+        except Exception as exc:
+            self.session_service.fail_turn(
+                session_id=turn.session["session_id"],
+                assistant_message_id=turn.assistant_message["msg_id"],
+                error_message=str(exc),
+                partial_content="".join(full_answer),
+            )
+            raise
 
     def get_session_history(self, session_id, limit=50):
-        return {"session_id": session_id, "messages": self.repo.list_messages(session_id=session_id, limit=limit)}
+        return {"session_id": session_id, "messages": self.session_service.list_messages(session_id=session_id, limit=limit)}
+
+    def create_session(self, title=None):
+        return self.session_service.create_session(title=title)
+
+    def list_sessions(self, limit=20, status="active"):
+        return {"items": self.session_service.list_sessions(limit=limit, status=status)}
+
+    def get_session_detail(self, session_id, message_limit=50):
+        return self.session_service.get_session_detail(session_id=session_id, message_limit=message_limit)
+
+    def update_session(self, session_id, title=None, status=None):
+        return self.session_service.update_session(session_id=session_id, title=title, status=status)
+
+    def delete_session(self, session_id):
+        return self.session_service.delete_session(session_id=session_id)
 
     def get_citation_view(self, citation_id, context_before, context_after):
         citation = self.repo.get_citation(citation_id)
@@ -398,6 +561,115 @@ class LegalRagService:
             "context_text": context_text,
             "highlight": {"method": "offset", "start": local_start, "end": local_end},
             "fallback": None,
+        }
+
+    def get_document_file(self, doc_id: str) -> Dict[str, Any]:
+        doc = self.repo.get_document(doc_id)
+        if doc is None:
+            raise KeyError("文档不存在")
+        file_path = self._ensure_original_viewable(doc)
+        media_type = doc.get("mime_type") or mimetypes.guess_type(doc.get("original_file_name") or file_path.name)[0] or "application/octet-stream"
+        return {
+            "doc": doc,
+            "file_path": file_path,
+            "media_type": media_type,
+            "file_name": doc.get("original_file_name") or file_path.name,
+        }
+
+    def get_citation_open_target(self, citation_id: str) -> Dict[str, Any]:
+        citation = self.repo.get_citation(citation_id)
+        if citation is None:
+            raise KeyError("引用不存在")
+
+        doc = self.repo.get_document(citation["doc_id"])
+        chunk = self.chunk_lookup.get(citation["chunk_id"])
+        if doc is None or chunk is None:
+            raise KeyError("引用对应文档或片段不存在")
+
+        self._ensure_original_viewable(doc)
+
+        doc_id = doc["doc_id"]
+        download_url = f"{settings.API_PREFIX}/docs/{doc_id}/file"
+        if doc["doc_type"] == "pdf":
+            page = chunk.page_start or citation["payload"].get("location", {}).get("page")
+            page_part = int(page) if page else None
+            url = download_url if page_part is None else f"{download_url}#page={page_part}"
+            segment_label = f"第 {page_part} 页" if page_part else "原始 PDF"
+            return {
+                "doc_id": doc_id,
+                "title": doc["title"],
+                "doc_type": doc["doc_type"],
+                "target_kind": "pdf",
+                "url": url,
+                "page": page_part,
+                "segment_label": segment_label,
+                "download_url": download_url,
+                "viewer_ready": True,
+            }
+
+        locator = chunk.locator_json or {}
+        paragraph_start = locator.get("paragraph_start")
+        paragraph_end = locator.get("paragraph_end")
+        if paragraph_start and paragraph_end:
+            if paragraph_start == paragraph_end:
+                segment_label = f"第 {paragraph_start} 段"
+            else:
+                segment_label = f"第 {paragraph_start}-{paragraph_end} 段"
+        else:
+            segment_label = citation["payload"].get("location", {}).get("section") or "定位片段"
+
+        return {
+            "doc_id": doc_id,
+            "title": doc["title"],
+            "doc_type": doc["doc_type"],
+            "target_kind": "text_viewer",
+            "url": f"/document-viewer/?doc_id={doc_id}&citation_id={citation_id}",
+            "page": None,
+            "segment_label": segment_label,
+            "download_url": download_url,
+            "viewer_ready": True,
+        }
+
+    def get_document_viewer_content(self, doc_id: str, citation_id: str) -> Dict[str, Any]:
+        doc = self.repo.get_document(doc_id)
+        if doc is None:
+            raise KeyError("文档不存在")
+
+        citation = self.repo.get_citation(citation_id)
+        if citation is None or citation["doc_id"] != doc_id:
+            raise KeyError("引用不存在")
+
+        chunk = self.chunk_lookup.get(citation["chunk_id"])
+        if chunk is None:
+            raise KeyError("引用片段不存在")
+
+        self._ensure_original_viewable(doc)
+
+        full_text = doc.get("text", "")
+        if doc.get("doc_type") == "docx" and doc.get("paragraph_spans"):
+            blocks = self._make_blocks_from_spans(full_text, doc["paragraph_spans"])
+        else:
+            blocks = self._split_text_blocks(full_text)
+
+        highlight = {
+            "start": chunk.start_pos,
+            "end": chunk.end_pos,
+            **self._locate_highlight_blocks(blocks, chunk.start_pos, chunk.end_pos),
+        }
+
+        return {
+            "doc_id": doc_id,
+            "title": doc["title"],
+            "doc_type": doc["doc_type"],
+            "viewer_mode": doc.get("viewer_mode") or "structured_text",
+            "download_url": f"{settings.API_PREFIX}/docs/{doc_id}/file",
+            "blocks": blocks,
+            "highlight": highlight,
+            "citation_meta": {
+                "section": chunk.section,
+                "article_no": chunk.article_no,
+                "snippet": citation["payload"].get("snippet", ""),
+            },
         }
 
     # ─── 实验评测 ────────────────────────────────────────
@@ -474,6 +746,15 @@ class LegalRagService:
             return list(self.chunk_lookup.values())
 
 
-# ─── 全局引擎实例（router 通过 from app.core.rag_engine import engine 使用）
-engine = LegalRagService(default_chunk_size=settings.CHUNK_SIZE, default_chunk_overlap=settings.CHUNK_OVERLAP)
+# ─── 懒加载引擎实例（router 仍通过 from app.core.rag_engine import engine 使用）
+@lru_cache(maxsize=1)
+def get_engine() -> LegalRagService:
+    return LegalRagService(default_chunk_size=settings.CHUNK_SIZE, default_chunk_overlap=settings.CHUNK_OVERLAP)
 
+
+class _LazyEngineProxy:
+    def __getattr__(self, name: str):
+        return getattr(get_engine(), name)
+
+
+engine = _LazyEngineProxy()
