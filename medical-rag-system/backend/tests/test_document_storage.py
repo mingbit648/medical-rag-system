@@ -67,6 +67,8 @@ class DocumentStorageTests(unittest.TestCase):
         self.assertEqual(repo.payload["content_text"], "employment dispute evidence")
         self.assertEqual(repo.payload["file_path"], "uploads/doc_test/original.txt")
         self.assertNotIn("text", repo.payload["meta"])
+        self.assertEqual(len(repo.payload["meta"]["source_fingerprint"]), 40)
+        self.assertEqual(repo.payload["meta"]["semantic_chunking_enabled"], False)
 
     def test_doc_row_to_dict_prefers_content_text_and_falls_back_to_legacy_meta_text(self):
         current = PgRepository._doc_row_to_dict(

@@ -1,42 +1,56 @@
+import argparse
 import json
-import urllib.request
 import sys
+from pathlib import Path
+import urllib.request
 
-try:
-    req = urllib.request.Request("http://localhost:8001/api/v1/experiments/runs")
+from experiment_utils import write_run_artifacts
+
+
+DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parent.parent / "experiment_outputs"
+DEFAULT_LATEST_REPORT = Path(__file__).resolve().parent / "experiment_results.md"
+
+
+def _fetch_json(url: str) -> dict:
+    req = urllib.request.Request(url)
     with urllib.request.urlopen(req) as response:
-        data = json.loads(response.read().decode())
-    runs = data.get("data", {}).get("items", [])
-    if not runs:
-        print("No runs found")
+        return json.loads(response.read().decode("utf-8"))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="拉取实验结果并重新导出归档文件")
+    parser.add_argument("--api-base", default="http://localhost:8001", help="后端 API 地址")
+    parser.add_argument("--run-id", default="", help="指定 run_id；为空时默认取最新一次")
+    parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT), help="实验结果归档目录")
+    parser.add_argument("--latest-report", default=str(DEFAULT_LATEST_REPORT), help="最新实验摘要 Markdown 输出路径")
+    args = parser.parse_args()
+
+    try:
+        run_id = args.run_id.strip()
+        if not run_id:
+            runs = _fetch_json(f"{args.api_base}/api/v1/experiments/runs").get("data", {}).get("items", [])
+            if not runs:
+                print("没有实验记录")
+                sys.exit(1)
+            run_id = runs[0]["run_id"]
+
+        run_payload = _fetch_json(f"{args.api_base}/api/v1/experiments/runs/{run_id}").get("data", {})
+        if not run_payload:
+            print(f"未找到实验记录: {run_id}")
+            sys.exit(1)
+
+        output_dir = write_run_artifacts(
+            run_payload,
+            Path(args.output_root),
+            latest_markdown_path=Path(args.latest_report),
+        )
+        print(f"已导出实验结果: {run_id}")
+        print(f"归档目录: {output_dir}")
+        print(f"最新摘要: {args.latest_report}")
+    except Exception as exc:
+        print(f"导出实验结果失败: {exc}")
         sys.exit(1)
-        
-    latest_run = runs[0]
-    metrics = latest_run["metrics"]
-    
-    output = []
-    output.append("# 实验结果报告")
-    output.append(f"**实验 ID**: `{latest_run['run_id']}`")
-    output.append(f"**模式**: `baseline vs hybrid+rerank`")
-    output.append(f"**测试用例数**: {metrics['total_cases']}")
-    output.append("")
-    output.append("## 指标对比 (Top@5)")
-    output.append("| 指标 | Baseline (Vector-only) | Improved (Hybrid+Rerank) |")
-    output.append("|---|---|---|")
-    output.append(f"| Recall@5 | {metrics['baseline']['recall@5']} | {metrics['improved']['recall@5']} |")
-    output.append(f"| MRR | {metrics['baseline']['mrr']} | {metrics['improved']['mrr']} |")
-    output.append("")
-    output.append("## 逐条结果")
-    for i, c in enumerate(metrics.get("cases", []), 1):
-        q = c["query"].replace("\n", " ")
-        output.append(f"**{i}. {q}**")
-        output.append(f"- Baseline Recall: {c.get('baseline_recall@5')}")
-        output.append(f"- Improved Recall: {c.get('improved_recall@5')}")
-        output.append("")
 
-    with open("c:/Users/lmd16/Desktop/medical-rag-system/medical-rag-system/scripts/experiment_results.md", "w", encoding="utf-8") as f:
-        f.write("\n".join(output))
-    print("Results saved")
 
-except Exception as e:
-    print(f"Error: {e}")
+if __name__ == "__main__":
+    main()

@@ -1,6 +1,7 @@
 from typing import Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse
 
 from app.core.rag_engine import engine
 from app.models.schemas import IndexRequest
@@ -8,6 +9,10 @@ from app.utils.response import make_trace_id, ok
 
 
 router = APIRouter()
+
+
+def _raise_conflict(message: str, *, code: str) -> None:
+    raise HTTPException(status_code=409, detail={"code": code, "message": message})
 
 
 @router.post("/import")
@@ -60,7 +65,44 @@ async def get_doc_status(doc_id: str):
         raise HTTPException(status_code=404, detail=str(exc))
 
 
+@router.get("/{doc_id}/file")
+async def get_doc_file(doc_id: str):
+    try:
+        result = engine.get_document_file(doc_id)
+        return FileResponse(
+            path=result["file_path"],
+            media_type=result["media_type"],
+            filename=result["file_name"],
+            headers={"Content-Disposition": f'inline; filename="{result["file_name"]}"'},
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        _raise_conflict(str(exc), code="ORIGINAL_VIEW_UNAVAILABLE")
+
+
+@router.get("/{doc_id}/viewer-content")
+async def get_doc_viewer_content(doc_id: str, citation_id: str = Query(...)):
+    trace_id = make_trace_id()
+    try:
+        return ok(engine.get_document_viewer_content(doc_id, citation_id), trace_id=trace_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        _raise_conflict(str(exc), code="ORIGINAL_VIEW_UNAVAILABLE")
+
+
 @router.get("")
 async def list_docs():
     trace_id = make_trace_id()
     return ok({"items": engine.list_docs()}, trace_id=trace_id)
+
+
+@router.delete("/{doc_id}")
+async def delete_doc(doc_id: str):
+    trace_id = make_trace_id()
+    try:
+        engine.delete_document(doc_id)
+        return ok({"doc_id": doc_id, "deleted": True}, trace_id=trace_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))

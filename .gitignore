@@ -18,3 +18,6 @@ medical-rag-system/frontend/out/
 /技术方案.md
 /需求文档.md
 /国家法律法规数据/
+medical-rag-system/.agents/
+medical-rag-system/recent_changes.patch
+medical-rag-system/backend/tests/tmp*/

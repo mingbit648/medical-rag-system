@@ -14,6 +14,7 @@ async def run_experiment(request: ExperimentRunRequest):
     try:
         result = engine.run_experiment(
             dataset=[item.model_dump() for item in request.dataset],
+            dataset_version=request.dataset_version,
             topn=request.topn.model_dump(),
             fusion=request.fusion.model_dump(),
             rerank=request.rerank.model_dump(),

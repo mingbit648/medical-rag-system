@@ -80,13 +80,16 @@ class RetrieveDebugRequest(BaseModel):
 
 
 class ExperimentCase(BaseModel):
+    case_id: Optional[str] = None
     query: str = Field(min_length=1)
     relevant_chunk_ids: List[str] = Field(default_factory=list)
     relevant_doc_ids: List[str] = Field(default_factory=list)
+    notes: Optional[str] = None
 
 
 class ExperimentRunRequest(BaseModel):
     dataset: List[ExperimentCase] = Field(min_length=1)
+    dataset_version: Optional[str] = None
     topn: TopNOption = TopNOption()
     fusion: FusionOption = FusionOption()
     rerank: RerankOption = RerankOption()

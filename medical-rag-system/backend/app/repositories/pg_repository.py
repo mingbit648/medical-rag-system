@@ -224,6 +224,9 @@ class PgRepository:
         row["has_original_file"] = bool(meta.get("has_original_file"))
         row["viewer_mode"] = meta.get("viewer_mode")
         row["source_version"] = meta.get("source_version")
+        row["source_fingerprint"] = meta.get("source_fingerprint")
+        row["chunk_strategy_version"] = meta.get("chunk_strategy_version")
+        row["semantic_chunking_enabled"] = bool(meta.get("semantic_chunking_enabled"))
         row["page_spans"] = meta.get("page_spans") or []
         row["paragraph_spans"] = meta.get("paragraph_spans") or []
         return row
@@ -346,16 +349,29 @@ class PgRepository:
             cur.execute("DELETE FROM documents WHERE doc_id = %s", (doc_id,))
             return cur.rowcount > 0
 
-    def update_document_index_status(self, doc_id: str, parse_status: str, chunks: int) -> None:
+    def update_document_index_status(
+        self,
+        doc_id: str,
+        parse_status: str,
+        chunks: int,
+        *,
+        meta_updates: Optional[Dict[str, Any]] = None,
+    ) -> None:
         with self._cursor() as cur:
+            cur.execute("SELECT meta_json FROM documents WHERE doc_id = %s", (doc_id,))
+            row = cur.fetchone()
+            current_meta = self._load_json(row.get("meta_json") if row else None, {})
+            current_meta["chunks"] = chunks
+            if meta_updates:
+                current_meta.update(meta_updates)
             cur.execute(
                 """
                 UPDATE documents
                 SET parse_status = %s,
-                    meta_json = jsonb_set(COALESCE(meta_json, '{}'::jsonb), '{chunks}', %s::jsonb)
+                    meta_json = %s::jsonb
                 WHERE doc_id = %s
                 """,
-                (parse_status, json.dumps(chunks), doc_id),
+                (parse_status, json.dumps(current_meta, ensure_ascii=False), doc_id),
             )
 
     def replace_chunks(self, doc_id: str, chunks: List[Dict[str, Any]]) -> None:

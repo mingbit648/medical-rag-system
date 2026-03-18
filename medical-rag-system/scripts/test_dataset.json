@@ -1,162 +1,301 @@
 {
-    "description": "劳动争议法律辅助咨询 — 20+ 测试问题集（FR-10），用于 baseline vs hybrid+rerank 对比实验",
-    "dataset": [
-        {
-            "query": "公司连续三个月拖欠工资，劳动者可以怎么维权？",
-            "relevant_doc_ids": [
-                "劳动法",
-                "劳动合同法",
-                "劳动争议调解仲裁法"
-            ]
-        },
-        {
-            "query": "劳动合同到期后公司不续签，劳动者能获得什么赔偿？",
-            "relevant_doc_ids": [
-                "劳动合同法"
-            ]
-        },
-        {
-            "query": "用人单位违法解除劳动合同，劳动者如何申请劳动仲裁？",
-            "relevant_doc_ids": [
-                "劳动合同法",
-                "劳动争议调解仲裁法"
-            ]
-        },
-        {
-            "query": "劳动者加班费的计算标准是什么？法定节假日加班如何计算？",
-            "relevant_doc_ids": [
-                "劳动法"
-            ]
-        },
-        {
-            "query": "用人单位未签订书面劳动合同，劳动者有什么权利？",
-            "relevant_doc_ids": [
-                "劳动合同法"
-            ]
-        },
-        {
-            "query": "劳动者工伤后有哪些法定的工伤待遇？",
-            "relevant_doc_ids": [
-                "劳动法"
-            ]
-        },
-        {
-            "query": "试用期的最长时间是多少？试用期工资的最低标准是什么？",
-            "relevant_doc_ids": [
-                "劳动合同法"
-            ]
-        },
-        {
-            "query": "什么情况下可以签订无固定期限劳动合同？",
-            "relevant_doc_ids": [
-                "劳动合同法"
-            ]
-        },
-        {
-            "query": "劳动合同中约定违约金的法律规定是什么？",
-            "relevant_doc_ids": [
-                "劳动合同法"
-            ]
-        },
-        {
-            "query": "劳动保障监察部门对用人单位不缴纳社保如何处罚？",
-            "relevant_doc_ids": [
-                "劳动保障监察条例"
-            ]
-        },
-        {
-            "query": "女职工在孕期、产期、哺乳期享有哪些特别保护？",
-            "relevant_doc_ids": [
-                "女职工劳动保护特别规定",
-                "劳动合同法"
-            ]
-        },
-        {
-            "query": "劳动争议仲裁时效是多长时间？从什么时候开始计算？",
-            "relevant_doc_ids": [
-                "劳动争议调解仲裁法"
-            ]
-        },
-        {
-            "query": "用人单位经济性裁员的法定程序和条件是什么？",
-            "relevant_doc_ids": [
-                "劳动合同法"
-            ]
-        },
-        {
-            "query": "劳务派遣用工有什么限制？劳务派遣工和正式工有什么区别？",
-            "relevant_doc_ids": [
-                "劳动合同法"
-            ]
-        },
-        {
-            "query": "劳动仲裁不服的话可以向法院起诉吗？哪些劳动争议是一裁终局的？",
-            "relevant_doc_ids": [
-                "劳动争议调解仲裁法"
-            ]
-        },
-        {
-            "query": "竞业限制协议的最长期限和经济补偿标准是什么？",
-            "relevant_doc_ids": [
-                "劳动合同法"
-            ]
-        },
-        {
-            "query": "用人单位未依法缴纳社会保险，劳动者能否解除劳动合同并要求经济补偿？",
-            "relevant_doc_ids": [
-                "劳动合同法",
-                "劳动法"
-            ]
-        },
-        {
-            "query": "集体合同的签订程序和效力是怎样的？",
-            "relevant_doc_ids": [
-                "劳动合同法",
-                "劳动法"
-            ]
-        },
-        {
-            "query": "哪些劳动争议事项适用举证责任倒置？",
-            "relevant_doc_ids": [
-                "劳动争议调解仲裁法"
-            ]
-        },
-        {
-            "query": "劳动保障监察员在执法过程中应当遵守哪些规定？",
-            "relevant_doc_ids": [
-                "劳动保障监察条例"
-            ]
-        },
-        {
-            "query": "女职工产假天数和产假工资标准是什么？",
-            "relevant_doc_ids": [
-                "女职工劳动保护特别规定"
-            ]
-        },
-        {
-            "query": "未成年工的使用限制有哪些规定？",
-            "relevant_doc_ids": [
-                "劳动法"
-            ]
-        },
-        {
-            "query": "劳动就业服务企业需要满足什么条件才能设立？",
-            "relevant_doc_ids": [
-                "劳动就业服务企业管理规定"
-            ]
-        },
-        {
-            "query": "用人单位拖欠劳动报酬，劳动者可以直接申请支付令吗？",
-            "relevant_doc_ids": [
-                "劳动合同法",
-                "劳动争议调解仲裁法"
-            ]
-        },
-        {
-            "query": "劳动合同无效或部分无效的情形有哪些？",
-            "relevant_doc_ids": [
-                "劳动合同法"
-            ]
-        }
-    ]
+  "description": "劳动争议法律辅助咨询 — 20+ 测试问题集（FR-10），用于 4 组检索对比实验",
+  "dataset": [
+    {
+      "case_id": "case_01",
+      "query": "公司连续三个月拖欠工资，劳动者可以怎么维权？",
+      "relevant_doc_ids": [
+        "劳动法",
+        "劳动合同法",
+        "劳动争议调解仲裁法"
+      ],
+      "relevant_chunk_ids": [
+        "chk_f47e78b403cf57df",
+        "chk_e5e5e0dbf06c23ce",
+        "chk_8b1d9083f67cbdaf"
+      ]
+    },
+    {
+      "case_id": "case_02",
+      "query": "劳动合同到期后公司不续签，劳动者能获得什么赔偿？",
+      "relevant_doc_ids": [
+        "劳动合同法"
+      ],
+      "relevant_chunk_ids": [
+        "chk_5199b5631853193a",
+        "chk_12b688d1d9c897a1"
+      ],
+      "notes": "固定期限劳动合同到期不续签通常对应经济补偿，而不是违法解除情形下的赔偿金。"
+    },
+    {
+      "case_id": "case_03",
+      "query": "用人单位违法解除劳动合同，劳动者如何申请劳动仲裁？",
+      "relevant_doc_ids": [
+        "劳动合同法",
+        "劳动争议调解仲裁法"
+      ],
+      "relevant_chunk_ids": [
+        "chk_9c40149a0c87139c",
+        "chk_94733e14293259e9",
+        "chk_7774de277a0e4ae9"
+      ]
+    },
+    {
+      "case_id": "case_04",
+      "query": "劳动者加班费的计算标准是什么？法定节假日加班如何计算？",
+      "relevant_doc_ids": [
+        "劳动法"
+      ],
+      "relevant_chunk_ids": [
+        "chk_479c739440c8135e"
+      ]
+    },
+    {
+      "case_id": "case_05",
+      "query": "用人单位未签订书面劳动合同，劳动者有什么权利？",
+      "relevant_doc_ids": [
+        "劳动合同法"
+      ],
+      "relevant_chunk_ids": [
+        "chk_5c37bca5b054611a",
+        "chk_978707eedf4eafe3",
+        "chk_975f697fff9887f0"
+      ]
+    },
+    {
+      "case_id": "case_06",
+      "query": "劳动者工伤后有哪些法定的工伤待遇？",
+      "relevant_doc_ids": [
+        "劳动法"
+      ],
+      "relevant_chunk_ids": [
+        "chk_54b590e6bf7a46c7"
+      ],
+      "notes": "当前语料未纳入《工伤保险条例》，本题以《劳动法》第七十三条作为工伤待遇总则证据。"
+    },
+    {
+      "case_id": "case_07",
+      "query": "试用期的最长时间是多少？试用期工资的最低标准是什么？",
+      "relevant_doc_ids": [
+        "劳动合同法"
+      ],
+      "relevant_chunk_ids": [
+        "chk_ccb0548e48017b3b",
+        "chk_d302f6ee15563758"
+      ]
+    },
+    {
+      "case_id": "case_08",
+      "query": "什么情况下可以签订无固定期限劳动合同？",
+      "relevant_doc_ids": [
+        "劳动合同法"
+      ],
+      "relevant_chunk_ids": [
+        "chk_c6a4d5864ed2ff12"
+      ]
+    },
+    {
+      "case_id": "case_09",
+      "query": "劳动合同中约定违约金的法律规定是什么？",
+      "relevant_doc_ids": [
+        "劳动合同法"
+      ],
+      "relevant_chunk_ids": [
+        "chk_7017d84a5e5f8984",
+        "chk_c7462db16fcce7f8",
+        "chk_7093a5080aa5325f"
+      ]
+    },
+    {
+      "case_id": "case_10",
+      "query": "劳动保障监察部门对用人单位不缴纳社保如何处罚？",
+      "relevant_doc_ids": [
+        "劳动保障监察条例"
+      ],
+      "relevant_chunk_ids": [
+        "chk_20ba3b1cddd9dcf6"
+      ],
+      "notes": "当前语料对未缴纳社会保险费的直接处罚以《劳动法》第一百条为主，《劳动保障监察条例》更多覆盖监察职责与瞒报情形。"
+    },
+    {
+      "case_id": "case_11",
+      "query": "女职工在孕期、产期、哺乳期享有哪些特别保护？",
+      "relevant_doc_ids": [
+        "女职工劳动保护特别规定",
+        "劳动合同法"
+      ],
+      "relevant_chunk_ids": [
+        "chk_7bc57421ef9370a6",
+        "chk_7351d9253a5252b1",
+        "chk_139b18b6928eddb9",
+        "chk_44d8642aa664e292"
+      ]
+    },
+    {
+      "case_id": "case_12",
+      "query": "劳动争议仲裁时效是多长时间？从什么时候开始计算？",
+      "relevant_doc_ids": [
+        "劳动争议调解仲裁法"
+      ],
+      "relevant_chunk_ids": [
+        "chk_f32e35c92afbd446"
+      ]
+    },
+    {
+      "case_id": "case_13",
+      "query": "用人单位经济性裁员的法定程序和条件是什么？",
+      "relevant_doc_ids": [
+        "劳动合同法"
+      ],
+      "relevant_chunk_ids": [
+        "chk_cfe2e2e021d3c969",
+        "chk_089d1ffac9029b36"
+      ]
+    },
+    {
+      "case_id": "case_14",
+      "query": "劳务派遣用工有什么限制？劳务派遣工和正式工有什么区别？",
+      "relevant_doc_ids": [
+        "劳动合同法"
+      ],
+      "relevant_chunk_ids": [
+        "chk_e1bff62d98b67a6d",
+        "chk_32167f80e59563d5",
+        "chk_c9da08ad4019a3ea",
+        "chk_893ca695d5af55ee"
+      ]
+    },
+    {
+      "case_id": "case_15",
+      "query": "劳动仲裁不服的话可以向法院起诉吗？哪些劳动争议是一裁终局的？",
+      "relevant_doc_ids": [
+        "劳动争议调解仲裁法"
+      ],
+      "relevant_chunk_ids": [
+        "chk_9c40149a0c87139c",
+        "chk_e8e0605f89a81ee5",
+        "chk_8e4e4b21c6f2bf2a"
+      ]
+    },
+    {
+      "case_id": "case_16",
+      "query": "竞业限制协议的最长期限和经济补偿标准是什么？",
+      "relevant_doc_ids": [
+        "劳动合同法"
+      ],
+      "relevant_chunk_ids": [
+        "chk_7093a5080aa5325f",
+        "chk_86b25554e3ba20ca"
+      ],
+      "notes": "入库法规仅明确竞业限制期限不得超过二年，并要求在竞业限制期限内按月给予经济补偿，未给出统一数额标准。"
+    },
+    {
+      "case_id": "case_17",
+      "query": "用人单位未依法缴纳社会保险，劳动者能否解除劳动合同并要求经济补偿？",
+      "relevant_doc_ids": [
+        "劳动合同法",
+        "劳动法"
+      ],
+      "relevant_chunk_ids": [
+        "chk_449aa95e021ca680",
+        "chk_5199b5631853193a"
+      ]
+    },
+    {
+      "case_id": "case_18",
+      "query": "集体合同的签订程序和效力是怎样的？",
+      "relevant_doc_ids": [
+        "劳动合同法",
+        "劳动法"
+      ],
+      "relevant_chunk_ids": [
+        "chk_001ea660418eff6e",
+        "chk_1f0e2118a4769cb7",
+        "chk_ede521843ceaa360",
+        "chk_e4e32a692fc740ee"
+      ]
+    },
+    {
+      "case_id": "case_19",
+      "query": "哪些劳动争议事项适用举证责任倒置？",
+      "relevant_doc_ids": [
+        "劳动争议调解仲裁法"
+      ],
+      "relevant_chunk_ids": [
+        "chk_14079aca15e22ff6"
+      ]
+    },
+    {
+      "case_id": "case_20",
+      "query": "劳动保障监察员在执法过程中应当遵守哪些规定？",
+      "relevant_doc_ids": [
+        "劳动保障监察条例"
+      ],
+      "relevant_chunk_ids": [
+        "chk_ac652d59c993dc99",
+        "chk_c364c48276ac705c",
+        "chk_6fd558050a283b0d"
+      ]
+    },
+    {
+      "case_id": "case_21",
+      "query": "女职工产假天数和产假工资标准是什么？",
+      "relevant_doc_ids": [
+        "女职工劳动保护特别规定"
+      ],
+      "relevant_chunk_ids": [
+        "chk_139b18b6928eddb9",
+        "chk_7a685317e0f6446c"
+      ]
+    },
+    {
+      "case_id": "case_22",
+      "query": "未成年工的使用限制有哪些规定？",
+      "relevant_doc_ids": [
+        "劳动法"
+      ],
+      "relevant_chunk_ids": [
+        "chk_af85ca38a71d9615",
+        "chk_3aed9c5a863dd641",
+        "chk_d424cd30aacbd8da"
+      ]
+    },
+    {
+      "case_id": "case_23",
+      "query": "劳动就业服务企业需要满足什么条件才能设立？",
+      "relevant_doc_ids": [
+        "劳动就业服务企业管理规定"
+      ],
+      "relevant_chunk_ids": [
+        "chk_64c5e5ff2e7f621d",
+        "chk_bb8a1e3b3431b180"
+      ],
+      "notes": "现有语料更侧重审批登记和主办扶持条件，未形成更细的准入清单条款。"
+    },
+    {
+      "case_id": "case_24",
+      "query": "用人单位拖欠劳动报酬，劳动者可以直接申请支付令吗？",
+      "relevant_doc_ids": [
+        "劳动合同法",
+        "劳动争议调解仲裁法"
+      ],
+      "relevant_chunk_ids": [
+        "chk_d2849722cd3bd0cc",
+        "chk_6a71dbab49dfca06",
+        "chk_8b1d9083f67cbdaf"
+      ],
+      "notes": "拖欠劳动报酬可直接申请支付令；若已就拖欠报酬等事项达成调解协议且单位逾期不履行，也可依法申请支付令。"
+    },
+    {
+      "case_id": "case_25",
+      "query": "劳动合同无效或部分无效的情形有哪些？",
+      "relevant_doc_ids": [
+        "劳动合同法"
+      ],
+      "relevant_chunk_ids": [
+        "chk_a03d7ae89c4a5b30",
+        "chk_8975e4b87d5536cb"
+      ]
+    }
+  ]
 }

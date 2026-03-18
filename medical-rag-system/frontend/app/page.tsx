@@ -20,9 +20,14 @@ export default function Home() {
                 <p className="home-redirect-copy">
                     系统会自动跳转到对话页。如果浏览器没有及时跳转，可以直接打开工作台入口。
                 </p>
-                <Link href="/chat/" className="home-redirect-link">
-                    进入对话页
-                </Link>
+                <div style={{ display: 'flex', gap: 16, marginTop: 18, flexWrap: 'wrap' }}>
+                    <Link href="/chat/" className="home-redirect-link">
+                        进入对话页
+                    </Link>
+                    <Link href="/knowledge/" className="home-redirect-link" style={{ color: 'var(--accent-navy)' }}>
+                        知识库管理
+                    </Link>
+                </div>
             </div>
         </main>
     )

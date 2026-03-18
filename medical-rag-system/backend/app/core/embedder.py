@@ -132,6 +132,14 @@ class EmbeddingService:
         self._lock = threading.Lock()
         self._provider: EmbeddingProvider = self._build_provider(model_name)
 
+    def _fallback_to_hash(self, reason: Exception) -> EmbeddingProvider:
+        with self._lock:
+            if isinstance(self._provider, HashEmbeddingProvider):
+                return self._provider
+            logger.warning("embedding provider 失败，自动降级为 hash embedding: %s", reason)
+            self._provider = HashEmbeddingProvider()
+            return self._provider
+
     def _build_provider(self, model_name: str) -> EmbeddingProvider:
         from app.core.config import settings
 
@@ -177,4 +185,8 @@ class EmbeddingService:
             return True
 
     def embed_texts(self, texts: Sequence[str]) -> np.ndarray:
-        return self._provider.embed_texts(texts)
+        try:
+            return self._provider.embed_texts(texts)
+        except Exception as exc:
+            provider = self._fallback_to_hash(exc)
+            return provider.embed_texts(texts)

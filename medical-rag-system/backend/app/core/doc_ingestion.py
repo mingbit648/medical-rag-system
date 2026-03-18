@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import mimetypes
 import uuid
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.config import settings
 
+from .chunker import CHUNK_STRATEGY_VERSION
 from .text_utils import clean_text, extract_title, now_iso, strip_html
 
 
@@ -162,6 +164,10 @@ def _store_original_file(doc_id: str, file_name: str, content: bytes) -> str:
     return relative_path.as_posix()
 
 
+def _source_fingerprint(content: bytes) -> str:
+    return hashlib.sha1(content).hexdigest()
+
+
 def import_document(
     repo,
     file_name: str,
@@ -182,6 +188,9 @@ def import_document(
         "chunks": 0,
         "domain": "劳动法/通用",
         "source_version": 2,
+        "source_fingerprint": _source_fingerprint(content),
+        "chunk_strategy_version": CHUNK_STRATEGY_VERSION,
+        "semantic_chunking_enabled": False,
         "original_file_name": file_name,
         "mime_type": extracted.mime_type,
         "has_original_file": True,
