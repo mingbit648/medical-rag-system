@@ -14,9 +14,10 @@ import {
 } from '@ant-design/icons'
 import {
     deleteDocument,
-    importDocument,
+    importDocuments,
     indexDocument,
     listDocuments,
+    type BatchImportProgress,
     type DocStatusResult,
 } from '@/lib/api/legalRag'
 
@@ -24,6 +25,17 @@ const { Dragger } = Upload
 
 interface DocItem extends DocStatusResult {
     _loading?: 'indexing' | 'deleting'
+}
+
+interface UploadProgressState extends BatchImportProgress {
+    step: string
+}
+
+interface UploadSummaryState {
+    total: number
+    successCount: number
+    failureCount: number
+    failedFiles: string[]
 }
 
 const STATUS_MAP: Record<string, { label: string; tone: 'neutral' | 'success' | 'danger' }> = {
@@ -81,7 +93,8 @@ export default function KnowledgePage() {
     const [docs, setDocs] = useState<DocItem[]>([])
     const [loading, setLoading] = useState(false)
     const [uploading, setUploading] = useState(false)
-    const [uploadProgress, setUploadProgress] = useState<{ name: string; step: string } | null>(null)
+    const [uploadProgress, setUploadProgress] = useState<UploadProgressState | null>(null)
+    const [uploadSummary, setUploadSummary] = useState<UploadSummaryState | null>(null)
 
     const fetchDocs = useCallback(async () => {
         setLoading(true)
@@ -99,23 +112,50 @@ export default function KnowledgePage() {
         void fetchDocs()
     }, [fetchDocs])
 
-    const handleUpload = useCallback(
-        async (file: File) => {
+    const handleUploadBatch = useCallback(
+        async (files: File[]) => {
+            if (files.length === 0) return
+
             setUploading(true)
-            setUploadProgress({ name: file.name, step: '上传中' })
+            setUploadSummary(null)
             try {
-                const imported = await importDocument(file)
-                setUploadProgress({ name: file.name, step: '建立索引中' })
-                await indexDocument(imported.doc_id)
-                message.success(`《${imported.title}》已导入`)
-                void fetchDocs()
-            } catch (err: any) {
-                message.error(`上传失败：${err?.message || '未知错误'}`)
+                const result = await importDocuments(files, {
+                    onProgress: (progress) => {
+                        setUploadProgress({
+                            ...progress,
+                            step: progress.stage === 'uploading' ? '上传中' : '建立索引中',
+                        })
+                    },
+                })
+                const failedFiles = result.items.filter((item) => !item.success).map((item) => item.fileName)
+                const summary: UploadSummaryState = {
+                    total: result.total,
+                    successCount: result.successCount,
+                    failureCount: result.failureCount,
+                    failedFiles,
+                }
+                setUploadSummary(summary)
+
+                if (summary.failureCount === 0) {
+                    const importedTitles = result.items
+                        .filter((item) => item.success)
+                        .map((item) => item.title)
+                        .filter((title): title is string => Boolean(title))
+                    const titlePreview = importedTitles[0]
+                    const suffix = summary.total > 1 ? ` 等 ${summary.total} 份文档` : ''
+                    message.success(titlePreview ? `《${titlePreview}》${suffix}已完成导入并建立索引` : `已完成 ${summary.total} 份文档导入`)
+                } else if (summary.successCount === 0) {
+                    message.error(`批量上传失败：${failedFiles.slice(0, 3).join('、')}${failedFiles.length > 3 ? ' 等' : ''}`)
+                } else {
+                    message.warning(
+                        `批量上传完成，成功 ${summary.successCount} / ${summary.total}，失败 ${summary.failureCount}`
+                    )
+                }
+                await fetchDocs()
             } finally {
                 setUploading(false)
                 setUploadProgress(null)
             }
-            return false
         },
         [fetchDocs]
     )
@@ -231,7 +271,11 @@ export default function KnowledgePage() {
     const pendingCount = docs.filter((item) => item.parse_status !== 'indexed').length
     const totalChunks = docs.reduce((sum, item) => sum + (item.chunks || 0), 0)
     const sidebarStatusText = uploadProgress
-        ? `${uploadProgress.step} · ${uploadProgress.name}`
+        ? `${uploadProgress.currentIndex}/${uploadProgress.total} · ${uploadProgress.step} · ${uploadProgress.fileName}`
+        : uploadSummary
+            ? uploadSummary.failureCount > 0
+                ? `最近一批完成：成功 ${uploadSummary.successCount}，失败 ${uploadSummary.failureCount}。${uploadSummary.failedFiles[0] ? ` 首个失败文件：${uploadSummary.failedFiles[0]}` : ''}`
+                : `最近一批已处理完成：${uploadSummary.successCount} 份文档已入库。`
         : docs.length === 0
             ? '还没有文档，上传后会自动进入索引流程。'
             : pendingCount > 0
@@ -248,7 +292,7 @@ export default function KnowledgePage() {
                             <h1 className="kb-sidebar-title">知识库</h1>
                             <p className="kb-sidebar-subtitle">上传、索引、管理文档</p>
                         </div>
-                        <Link href="/chat" className="kb-chat-link">
+                        <Link href="/chat" className="kb-chat-link" prefetch={false}>
                             <MessageOutlined />
                             去对话
                         </Link>
@@ -256,10 +300,14 @@ export default function KnowledgePage() {
 
                     <Dragger
                         accept=".pdf,.html,.htm,.txt,.docx"
+                        multiple
                         showUploadList={false}
-                        beforeUpload={(file) => {
-                            void handleUpload(file)
-                            return false
+                        beforeUpload={(file, fileList) => {
+                            const isLastFile = file.uid === fileList[fileList.length - 1]?.uid
+                            if (isLastFile) {
+                                void handleUploadBatch(fileList as File[])
+                            }
+                            return Upload.LIST_IGNORE
                         }}
                         disabled={uploading}
                         className="kb-upload-card"
@@ -271,12 +319,14 @@ export default function KnowledgePage() {
                             {uploadProgress ? (
                                 <div className="kb-upload-copy">
                                     <div className="kb-upload-title">{uploadProgress.step}</div>
-                                    <div className="kb-upload-meta">{uploadProgress.name}</div>
+                                    <div className="kb-upload-meta">
+                                        {uploadProgress.currentIndex}/{uploadProgress.total} · {uploadProgress.fileName}
+                                    </div>
                                 </div>
                             ) : (
                                 <div className="kb-upload-copy">
-                                    <div className="kb-upload-title">拖入文件或点击上传</div>
-                                    <div className="kb-upload-meta">PDF / HTML / TXT / DOCX</div>
+                                    <div className="kb-upload-title">拖入文件或点击批量上传</div>
+                                    <div className="kb-upload-meta">支持多选，PDF / HTML / TXT / DOCX</div>
                                 </div>
                             )}
                         </div>
@@ -303,7 +353,7 @@ export default function KnowledgePage() {
                     </div>
 
                     <div className="kb-sidebar-note">
-                        文档上传后会自动进入索引流程，完成后即可在对话页检索并引用对应片段。
+                        文档上传后会按顺序自动进入索引流程。批量导入失败的文件不会阻塞剩余文件处理。
                     </div>
                 </aside>
 
@@ -318,7 +368,7 @@ export default function KnowledgePage() {
                         </div>
 
                         <div className="kb-main-actions">
-                            <Link href="/chat" className="kb-return-chat-btn">
+                            <Link href="/chat" className="kb-return-chat-btn" prefetch={false}>
                                 <ArrowLeftOutlined />
                                 返回咨询对话
                             </Link>
@@ -353,7 +403,7 @@ export default function KnowledgePage() {
                                         <p className="kb-empty-copy">
                                             上传法规、制度、案例摘要或内部材料后，聊天页就能基于这些内容给出可引用的回答。
                                         </p>
-                                        <Link href="/chat" className="kb-return-chat-btn inline">
+                                        <Link href="/chat" className="kb-return-chat-btn inline" prefetch={false}>
                                             <ArrowLeftOutlined />
                                             返回咨询对话
                                         </Link>

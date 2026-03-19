@@ -14,6 +14,31 @@ export interface DocImportResult {
     status: string
 }
 
+export interface BatchImportProgress {
+    total: number
+    currentIndex: number
+    fileName: string
+    stage: 'uploading' | 'indexing'
+}
+
+export interface BatchImportItemResult {
+    fileName: string
+    success: boolean
+    doc_id?: string
+    title?: string
+    doc_type?: string
+    status?: string
+    chunks?: number
+    error?: string
+}
+
+export interface BatchImportResult {
+    items: BatchImportItemResult[]
+    total: number
+    successCount: number
+    failureCount: number
+}
+
 export interface DocIndexResult {
     doc_id: string
     status: string
@@ -251,6 +276,63 @@ export async function importDocument(file: File, sourceUrl?: string, docType?: s
 
     const envelope = await response.json() as ApiEnvelope<DocImportResult>
     return unwrap(envelope)
+}
+
+export async function importDocuments(
+    files: File[],
+    options: {
+        sourceUrl?: string
+        docType?: string
+        chunkSize?: number
+        overlap?: number
+        onProgress?: (progress: BatchImportProgress) => void
+    } = {}
+): Promise<BatchImportResult> {
+    const normalizedFiles = files.filter((file): file is File => file instanceof File)
+    const items: BatchImportItemResult[] = []
+
+    for (const [index, file] of normalizedFiles.entries()) {
+        try {
+            options.onProgress?.({
+                total: normalizedFiles.length,
+                currentIndex: index + 1,
+                fileName: file.name,
+                stage: 'uploading',
+            })
+            const imported = await importDocument(file, options.sourceUrl, options.docType)
+            options.onProgress?.({
+                total: normalizedFiles.length,
+                currentIndex: index + 1,
+                fileName: file.name,
+                stage: 'indexing',
+            })
+            const indexed = await indexDocument(imported.doc_id, options.chunkSize, options.overlap)
+            items.push({
+                fileName: file.name,
+                success: true,
+                doc_id: imported.doc_id,
+                title: imported.title,
+                doc_type: imported.doc_type,
+                status: indexed.status,
+                chunks: indexed.chunks,
+            })
+        } catch (error: any) {
+            items.push({
+                fileName: file.name,
+                success: false,
+                error: error?.message || '未知错误',
+            })
+        }
+    }
+
+    const successCount = items.filter((item) => item.success).length
+
+    return {
+        items,
+        total: normalizedFiles.length,
+        successCount,
+        failureCount: items.length - successCount,
+    }
 }
 
 export async function indexDocument(docId: string, chunkSize = 800, overlap = 200): Promise<DocIndexResult> {
