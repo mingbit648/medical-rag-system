@@ -19,6 +19,7 @@ import {
     DRAFT_VIEW_KEY,
     remapOptimisticMessages,
     resolveInitialActiveView,
+    sortChatMessages,
     sortConversations,
     upsertConversation,
     type ActiveView,
@@ -75,6 +76,8 @@ function mapServerMessage(item: ChatHistoryMessage): ChatMessage | null {
         content: item.content,
         citations: item.citations,
         timestamp: new Date(item.created_at).getTime(),
+        requestId: item.request_id,
+        sessionSeq: typeof item.session_seq === 'number' ? item.session_seq : undefined,
         status: (item.status as ChatMessage['status']) || 'completed',
     }
 }
@@ -89,7 +92,7 @@ function mergeSummary(existing: ConversationRecord | undefined, session: ChatSes
 }
 
 function getConversationPreview(conversation: ConversationRecord) {
-    const latestMessage = [...conversation.messages].reverse().find((item) => item.content.trim())
+    const latestMessage = [...sortChatMessages(conversation.messages)].reverse().find((item) => item.content.trim())
     if (latestMessage) return latestMessage.content.replace(/\s+/g, ' ').trim().slice(0, 42)
     return (conversation.preview || '空白对话').replace(/\s+/g, ' ').trim().slice(0, 42)
 }
@@ -141,9 +144,10 @@ export default function ChatPage() {
         ? conversations.find((item) => item.session_id === activeSessionId) ?? null
         : null
     const currentMessages = activeView.kind === 'draft' ? draftState.messages : activeConversation?.messages ?? []
+    const orderedMessages = sortChatMessages(currentMessages)
     const inputValue = activeView.kind === 'draft' ? draftState.input : sessionInput
     const highlightPieces = toHighlightPieces(viewingCitation)
-    const citationCount = currentMessages.reduce((sum, item) => sum + (item.citations?.length ?? 0), 0)
+    const citationCount = orderedMessages.reduce((sum, item) => sum + (item.citations?.length ?? 0), 0)
     const currentViewKey = activeView.kind === 'draft' ? DRAFT_VIEW_KEY : activeView.sessionId
     const streaming = Boolean(streamingViewKey) && streamingViewKey === currentViewKey
     const conversationStateLabel = bootstrapping
@@ -331,8 +335,8 @@ export default function ChatPage() {
         const tempAssistantId = `temp_assistant_${requestId}`
         const optimisticMessages: ChatMessage[] = [
             ...currentMessages,
-            { id: tempUserId, role: 'user', content: query, timestamp: now, status: 'completed' },
-            { id: tempAssistantId, role: 'assistant', content: '', timestamp: now + 1, status: 'streaming' },
+            { id: tempUserId, role: 'user', content: query, timestamp: now, requestId, status: 'completed' },
+            { id: tempAssistantId, role: 'assistant', content: '', timestamp: now + 1, requestId, status: 'streaming' },
         ]
 
         if (activeView.kind === 'draft') {
@@ -635,9 +639,16 @@ export default function ChatPage() {
                                     className={`chat-session-item${activeView.kind === 'session' && conversation.session_id === activeView.sessionId ? ' active' : ''}`}
                                     onClick={() => void handleSelectConversation(conversation.session_id)}
                                 >
-                                    <span className="chat-session-title">{conversation.title}</span>
-                                    <span className="chat-session-preview">{getConversationPreview(conversation)}</span>
-                                    <span className="chat-session-time">{formatConversationTime(conversation.updated_at)}</span>
+                                    <div className="chat-session-copy">
+                                        <span className="chat-session-title">{conversation.title}</span>
+                                        <span className="chat-session-preview">{getConversationPreview(conversation)}</span>
+                                    </div>
+                                    <div className="chat-session-meta">
+                                        <span className="chat-session-count">
+                                            {conversation.message_count > 0 ? `${conversation.message_count} 条消息` : '空会话'}
+                                        </span>
+                                        <span className="chat-session-time">{formatConversationTime(conversation.updated_at)}</span>
+                                    </div>
                                 </button>
                                 <Tooltip title="删除对话">
                                     <button
@@ -701,7 +712,7 @@ export default function ChatPage() {
                                     </div>
                                 </section>
                             ) : (
-                                currentMessages.map((msg) => (
+                                orderedMessages.map((msg) => (
                                     <div key={msg.id} className={`chat-message-row ${msg.role}`}>
                                         <div className={`chat-bubble ${msg.role}`}>
                                             {msg.role === 'assistant' ? (
@@ -759,6 +770,13 @@ export default function ChatPage() {
 
                     <footer className="chat-input-area">
                         <div className="chat-input-panel">
+                            <div className="chat-input-surface">
+                                <div className="chat-input-copy">
+                                    <span className="chat-input-kicker">COMPOSE</span>
+                                    <span className="chat-input-meta">
+                                        {streaming ? '智能体正在生成回复' : 'Enter 发送 · Shift + Enter 换行'}
+                                    </span>
+                                </div>
                             <div className="chat-input-inner">
                                 <div className="chat-input-editor">
                                 <TextArea
@@ -785,6 +803,7 @@ export default function ChatPage() {
                                 >
                                     <SendOutlined />
                                 </button>
+                            </div>
                             </div>
                         </div>
                     </footer>

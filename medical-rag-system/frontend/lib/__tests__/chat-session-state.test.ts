@@ -1,4 +1,4 @@
-import { buildFallbackSessionSummary, remapOptimisticMessages, resolveInitialActiveView, upsertConversation, type ChatMessage, type ConversationRecord } from '@/lib/chat/sessionState'
+import { buildFallbackSessionSummary, remapOptimisticMessages, resolveInitialActiveView, sortChatMessages, upsertConversation, type ChatMessage, type ConversationRecord } from '@/lib/chat/sessionState'
 
 function makeConversation(sessionId: string, updatedAt: string): ConversationRecord {
     return {
@@ -95,5 +95,14 @@ describe('chat session state helpers', () => {
             'msg_user_current',
             'msg_assistant_current',
         ])
+    })
+
+    test('sortChatMessages keeps the user message first within a turn', () => {
+        const messages: ChatMessage[] = [
+            { id: 'msg_assistant', role: 'assistant', content: '回复', timestamp: 200, requestId: 'req_1', status: 'completed' },
+            { id: 'msg_user', role: 'user', content: '问题', timestamp: 200, requestId: 'req_1', status: 'completed' },
+        ]
+
+        expect(sortChatMessages(messages).map((item) => item.id)).toEqual(['msg_user', 'msg_assistant'])
     })
 })

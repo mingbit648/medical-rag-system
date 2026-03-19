@@ -8,6 +8,8 @@ export interface ChatMessage {
     content: string
     citations?: CitationItem[]
     timestamp: number
+    requestId?: string
+    sessionSeq?: number
     status: 'streaming' | 'completed' | 'error'
 }
 
@@ -30,6 +32,20 @@ function previewText(text: string, maxChars: number) {
 
 export function sortConversations(items: ConversationRecord[]) {
     return [...items].sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime())
+}
+
+export function sortChatMessages(messages: ChatMessage[]) {
+    return [...messages].sort((a, b) => {
+        const requestIdA = a.requestId || ''
+        const requestIdB = b.requestId || ''
+
+        if (requestIdA && requestIdA === requestIdB && a.role !== b.role) {
+            return a.role === 'user' ? -1 : 1
+        }
+        if (a.timestamp !== b.timestamp) return a.timestamp - b.timestamp
+        if (a.role !== b.role) return a.role === 'user' ? -1 : 1
+        return a.id.localeCompare(b.id)
+    })
 }
 
 export function resolveInitialActiveView(conversations: ConversationRecord[], storedActive: string): ActiveView {

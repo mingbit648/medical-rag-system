@@ -136,6 +136,7 @@ export interface ChatHistoryMessage {
     message_id?: string
     session_id: string
     session_seq?: number
+    request_id?: string
     role: 'user' | 'assistant' | 'system' | string
     content: string
     status?: 'streaming' | 'completed' | 'error' | string
