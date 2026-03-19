@@ -1,12 +1,13 @@
 import sys
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.config import settings
-from app.core.doc_ingestion import import_document
+from app.core.doc_ingestion import DuplicateDocumentError, import_document
 from app.core.rag_engine import LegalRagService
 from app.core.text_utils import ChunkRecord
 from app.repositories.pg_repository import PgRepository
@@ -15,9 +16,21 @@ from app.repositories.pg_repository import PgRepository
 class CaptureRepo:
     def __init__(self):
         self.payload = None
+        self.duplicate = None
+        self.cleared_doc_ids = []
+        self.documents = {}
 
     def upsert_document(self, payload):
         self.payload = payload
+
+    def find_document_by_source_fingerprint(self, _source_fingerprint):
+        return self.duplicate
+
+    def get_document(self, doc_id, *, include_text=True):
+        return self.documents.get(doc_id)
+
+    def clear_document_index(self, doc_id):
+        self.cleared_doc_ids.append(doc_id)
 
 
 class FakeDocRepo:
@@ -50,6 +63,24 @@ class FakeViewerRepo:
         return self.citation
 
 
+class FakeDetailRepo:
+    def __init__(self, doc, chunk_rows):
+        self.doc = doc
+        self.chunk_rows = chunk_rows
+
+    def get_document(self, doc_id, *, include_text=True):
+        if doc_id != self.doc["doc_id"]:
+            return None
+        return self.doc
+
+    def list_chunks(self, doc_id=None, indexed_only=False):
+        if indexed_only:
+            return []
+        if doc_id and doc_id != self.doc["doc_id"]:
+            return []
+        return self.chunk_rows
+
+
 class DocumentStorageTests(unittest.TestCase):
     def test_import_document_stores_content_text_outside_meta(self):
         repo = CaptureRepo()
@@ -68,7 +99,7 @@ class DocumentStorageTests(unittest.TestCase):
         self.assertEqual(repo.payload["file_path"], "uploads/doc_test/original.txt")
         self.assertNotIn("text", repo.payload["meta"])
         self.assertEqual(len(repo.payload["meta"]["source_fingerprint"]), 40)
-        self.assertEqual(repo.payload["meta"]["semantic_chunking_enabled"], False)
+        self.assertFalse(repo.payload["meta"]["semantic_chunking_enabled"])
 
     def test_doc_row_to_dict_prefers_content_text_and_falls_back_to_legacy_meta_text(self):
         current = PgRepository._doc_row_to_dict(
@@ -132,12 +163,63 @@ class DocumentStorageTests(unittest.TestCase):
         self.assertEqual(result["file_path"], stored_file)
         self.assertEqual(result["file_name"], "original.txt")
 
+    def test_import_document_rejects_duplicate_source_fingerprint(self):
+        repo = CaptureRepo()
+        repo.duplicate = {
+            "doc_id": "doc_existing",
+            "title": "duplicate doc",
+            "doc_type": "text",
+            "parse_status": "indexed",
+            "chunks": 3,
+            "created_at": datetime(2026, 3, 19, 0, 0, tzinfo=timezone.utc),
+            "original_file_name": "existing.txt",
+        }
+
+        with self.assertRaises(DuplicateDocumentError) as ctx:
+            import_document(
+                repo,
+                file_name="sample.txt",
+                content=b"employment dispute evidence",
+                doc_type="text",
+            )
+
+        self.assertIn("知识库已有《duplicate doc》", str(ctx.exception))
+        self.assertEqual(ctx.exception.existing_doc["doc_id"], "doc_existing")
+        self.assertEqual(ctx.exception.existing_doc["created_at"], "2026-03-19T00:00:00+00:00")
+
+    def test_import_document_overwrite_reuses_existing_doc_id_and_clears_old_index(self):
+        repo = CaptureRepo()
+        repo.documents["doc_existing"] = {
+            "doc_id": "doc_existing",
+            "title": "old doc",
+            "doc_type": "text",
+            "parse_status": "indexed",
+            "chunks": 4,
+            "created_at": "2026-03-19T00:00:00Z",
+        }
+
+        with patch("app.core.doc_ingestion._clear_original_file_dir") as clear_original_dir:
+            with patch("app.core.doc_ingestion._store_original_file", return_value="uploads/doc_existing/original.txt"):
+                result = import_document(
+                    repo,
+                    file_name="sample.txt",
+                    content=b"new evidence",
+                    doc_type="text",
+                    overwrite_doc_id="doc_existing",
+                )
+
+        clear_original_dir.assert_called_once_with("doc_existing")
+        self.assertEqual(repo.cleared_doc_ids, ["doc_existing"])
+        self.assertEqual(result["doc_id"], "doc_existing")
+        self.assertTrue(result["overwritten"])
+        self.assertEqual(repo.payload["doc_id"], "doc_existing")
+
     def test_document_viewer_content_returns_full_text_and_single_highlight_range(self):
         doc_id = "doc_view"
         citation_id = "c_view"
-        full_text = "第一段\n\n第二段命中内容\n\n第三段"
-        highlight_start = full_text.index("命中内容")
-        highlight_end = highlight_start + len("命中内容")
+        full_text = "first paragraph\n\nsecond paragraph hit text\n\nthird paragraph"
+        highlight_start = full_text.index("hit text")
+        highlight_end = highlight_start + len("hit text")
         repo = FakeViewerRepo(
             {
                 "doc_id": doc_id,
@@ -153,7 +235,7 @@ class DocumentStorageTests(unittest.TestCase):
                 "citation_id": citation_id,
                 "doc_id": doc_id,
                 "chunk_id": "chunk_view",
-                "payload": {"snippet": "命中内容"},
+                "payload": {"snippet": "hit text"},
             },
         )
         service = object.__new__(LegalRagService)
@@ -163,7 +245,7 @@ class DocumentStorageTests(unittest.TestCase):
                 chunk_id="chunk_view",
                 doc_id=doc_id,
                 chunk_index=0,
-                chunk_text="命中内容",
+                chunk_text="hit text",
                 start_pos=highlight_start,
                 end_pos=highlight_end,
             )
@@ -177,6 +259,59 @@ class DocumentStorageTests(unittest.TestCase):
         self.assertEqual(result["text"], full_text)
         self.assertEqual(result["highlight"], {"start": highlight_start, "end": highlight_end})
         self.assertNotIn("blocks", result)
+
+    def test_get_document_detail_returns_full_text_and_chunk_rows(self):
+        doc_id = "doc_detail"
+        repo = FakeDetailRepo(
+            {
+                "doc_id": doc_id,
+                "title": "detail.txt",
+                "doc_type": "text",
+                "parse_status": "indexed",
+                "chunks": 2,
+                "created_at": "2026-03-19T00:00:00Z",
+                "original_file_name": "detail.txt",
+                "viewer_mode": "structured_text",
+                "has_original_file": True,
+                "text": "part one\n\npart two",
+            },
+            [
+                {
+                    "chunk_id": "chunk_1",
+                    "chunk_index": 0,
+                    "chunk_text": "part one",
+                    "start_pos": 0,
+                    "end_pos": 8,
+                    "section": "sec-1",
+                    "article_no": None,
+                    "page_start": None,
+                    "page_end": None,
+                    "locator_json": {"unit_kind": "paragraph"},
+                },
+                {
+                    "chunk_id": "chunk_2",
+                    "chunk_index": 1,
+                    "chunk_text": "part two",
+                    "start_pos": 10,
+                    "end_pos": 18,
+                    "section": "sec-2",
+                    "article_no": None,
+                    "page_start": None,
+                    "page_end": None,
+                    "locator_json": {"unit_kind": "paragraph"},
+                },
+            ],
+        )
+        service = object.__new__(LegalRagService)
+        service.repo = repo
+
+        result = LegalRagService.get_document_detail(service, doc_id)
+
+        self.assertEqual(result["title"], "detail.txt")
+        self.assertEqual(result["download_url"], f"{settings.API_PREFIX}/docs/{doc_id}/file")
+        self.assertEqual(result["text"], "part one\n\npart two")
+        self.assertEqual(len(result["chunk_items"]), 2)
+        self.assertEqual(result["chunk_items"][1]["chunk_text"], "part two")
 
 
 if __name__ == "__main__":

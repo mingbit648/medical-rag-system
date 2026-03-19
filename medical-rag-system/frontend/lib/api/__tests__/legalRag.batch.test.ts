@@ -1,7 +1,7 @@
 import { apiClient } from '@/lib/api/client'
 import { importDocuments } from '@/lib/api/legalRag'
 
-function makeImportEnvelope(docId: string, title: string, docType = 'pdf') {
+function makeImportEnvelope(docId: string, title: string, docType = 'pdf', overwritten = false) {
     return {
         code: 0,
         message: 'ok',
@@ -10,8 +10,27 @@ function makeImportEnvelope(docId: string, title: string, docType = 'pdf') {
             title,
             doc_type: docType,
             status: 'imported',
+            overwritten,
         },
         trace_id: `trace_${docId}`,
+    }
+}
+
+function makeDuplicateErrorEnvelope(docId: string, title: string) {
+    return {
+        detail: {
+            code: 'DOCUMENT_ALREADY_EXISTS',
+            message: `知识库已有《${title}》，请确认是否覆盖。`,
+            existing_doc: {
+                doc_id: docId,
+                title,
+                doc_type: 'pdf',
+                parse_status: 'indexed',
+                chunks: 6,
+                created_at: '2026-03-19T10:00:00+08:00',
+                original_file_name: `${title}.pdf`,
+            },
+        },
     }
 }
 
@@ -94,6 +113,7 @@ describe('importDocuments', () => {
             total: 2,
             successCount: 2,
             failureCount: 0,
+            skippedCount: 0,
         })
         expect(onProgress.mock.calls).toEqual([
             [{ total: 2, currentIndex: 1, fileName: '劳动合同.pdf', stage: 'uploading' }],
@@ -130,6 +150,7 @@ describe('importDocuments', () => {
         expect(result.total).toBe(2)
         expect(result.successCount).toBe(1)
         expect(result.failureCount).toBe(1)
+        expect(result.skippedCount).toBe(0)
         expect(result.items).toEqual([
             expect.objectContaining({
                 fileName: 'alpha.pdf',
@@ -143,5 +164,93 @@ describe('importDocuments', () => {
                 chunks: 4,
             }),
         ])
+    })
+
+    test('skips duplicate documents when user declines overwrite', async () => {
+        const fetchMock = jest.fn()
+        global.fetch = fetchMock as typeof fetch
+        fetchMock.mockResolvedValueOnce({
+            ok: false,
+            status: 409,
+            json: async () => makeDuplicateErrorEnvelope('doc_existing', '员工手册'),
+        } as Response)
+
+        const postSpy = jest.spyOn(apiClient, 'post')
+        const onDuplicate = jest.fn().mockResolvedValue('skip')
+        const onProgress = jest.fn()
+
+        const result = await importDocuments(
+            [new File(['duplicate'], '员工手册.pdf', { type: 'application/pdf' })],
+            { onDuplicate, onProgress }
+        )
+
+        expect(onDuplicate).toHaveBeenCalledWith(
+            expect.objectContaining({
+                currentIndex: 1,
+                total: 1,
+                existingDocument: expect.objectContaining({ doc_id: 'doc_existing', title: '员工手册' }),
+            })
+        )
+        expect(postSpy).not.toHaveBeenCalled()
+        expect(result).toEqual({
+            items: [
+                expect.objectContaining({
+                    fileName: '员工手册.pdf',
+                    success: false,
+                    skipped: true,
+                    existingDocTitle: '员工手册',
+                    error: '已放弃覆盖《员工手册》',
+                }),
+            ],
+            total: 1,
+            successCount: 0,
+            failureCount: 0,
+            skippedCount: 1,
+        })
+        expect(onProgress.mock.calls).toEqual([
+            [{ total: 1, currentIndex: 1, fileName: '员工手册.pdf', stage: 'uploading' }],
+            [{ total: 1, currentIndex: 1, fileName: '员工手册.pdf', stage: 'awaiting_confirmation' }],
+        ])
+    })
+
+    test('retries duplicate documents with overwrite when user confirms', async () => {
+        const fetchMock = jest.fn()
+        global.fetch = fetchMock as typeof fetch
+        fetchMock
+            .mockResolvedValueOnce({
+                ok: false,
+                status: 409,
+                json: async () => makeDuplicateErrorEnvelope('doc_existing', '规章制度'),
+            } as Response)
+            .mockResolvedValueOnce({
+                ok: true,
+                json: async () => makeImportEnvelope('doc_existing', '规章制度', 'pdf', true),
+            } as Response)
+
+        const postSpy = jest.spyOn(apiClient, 'post').mockResolvedValueOnce(makeIndexEnvelope('doc_existing', 8))
+        const onDuplicate = jest.fn().mockResolvedValue('overwrite')
+
+        const result = await importDocuments(
+            [new File(['duplicate'], '规章制度.pdf', { type: 'application/pdf' })],
+            { onDuplicate }
+        )
+
+        expect(fetchMock).toHaveBeenCalledTimes(2)
+        expect(postSpy).toHaveBeenCalledTimes(1)
+        expect(result).toEqual({
+            items: [
+                expect.objectContaining({
+                    fileName: '规章制度.pdf',
+                    success: true,
+                    doc_id: 'doc_existing',
+                    chunks: 8,
+                    overwritten: true,
+                }),
+            ],
+            total: 1,
+            successCount: 1,
+            failureCount: 0,
+            skippedCount: 0,
+        })
     })
 })

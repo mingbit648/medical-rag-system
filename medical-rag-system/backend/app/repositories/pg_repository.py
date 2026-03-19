@@ -295,6 +295,7 @@ class PgRepository:
                     source_url = EXCLUDED.source_url,
                     file_path = EXCLUDED.file_path,
                     content_text = EXCLUDED.content_text,
+                    created_at = EXCLUDED.created_at,
                     parse_status = EXCLUDED.parse_status,
                     meta_json = EXCLUDED.meta_json
                 """,
@@ -342,12 +343,34 @@ class PgRepository:
             rows = cur.fetchall()
         return [self._doc_row_to_dict(dict(row)) for row in rows]
 
+    def find_document_by_source_fingerprint(self, source_fingerprint: str) -> Optional[Dict[str, Any]]:
+        with self._cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT {self._document_select_columns(include_text=False)}
+                FROM documents
+                WHERE meta_json ->> 'source_fingerprint' = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (source_fingerprint,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return self._doc_row_to_dict(dict(row))
+
     def delete_document(self, doc_id: str) -> bool:
         with self._cursor() as cur:
             cur.execute("DELETE FROM citations WHERE doc_id = %s", (doc_id,))
             cur.execute("DELETE FROM chunks WHERE doc_id = %s", (doc_id,))
             cur.execute("DELETE FROM documents WHERE doc_id = %s", (doc_id,))
             return cur.rowcount > 0
+
+    def clear_document_index(self, doc_id: str) -> None:
+        with self._cursor() as cur:
+            cur.execute("DELETE FROM citations WHERE doc_id = %s", (doc_id,))
+            cur.execute("DELETE FROM chunks WHERE doc_id = %s", (doc_id,))
 
     def update_document_index_status(
         self,

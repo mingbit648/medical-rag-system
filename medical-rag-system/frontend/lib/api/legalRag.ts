@@ -12,13 +12,24 @@ export interface DocImportResult {
     title: string
     doc_type: string
     status: string
+    overwritten?: boolean
+}
+
+export interface DuplicateDocumentInfo extends DocStatusResult {
+    original_file_name?: string | null
+}
+
+export interface ImportDocumentOptions {
+    sourceUrl?: string
+    docType?: string
+    overwriteDocId?: string
 }
 
 export interface BatchImportProgress {
     total: number
     currentIndex: number
     fileName: string
-    stage: 'uploading' | 'indexing'
+    stage: 'awaiting_confirmation' | 'uploading' | 'indexing'
 }
 
 export interface BatchImportItemResult {
@@ -29,6 +40,9 @@ export interface BatchImportItemResult {
     doc_type?: string
     status?: string
     chunks?: number
+    skipped?: boolean
+    overwritten?: boolean
+    existingDocTitle?: string
     error?: string
 }
 
@@ -37,6 +51,7 @@ export interface BatchImportResult {
     total: number
     successCount: number
     failureCount: number
+    skippedCount: number
 }
 
 export interface DocIndexResult {
@@ -56,6 +71,33 @@ export interface DocStatusResult {
     parse_status: string
     chunks: number
     created_at: string
+}
+
+export interface DocumentDetailChunk {
+    chunk_id: string
+    chunk_index: number
+    chunk_text: string
+    start_pos?: number | null
+    end_pos?: number | null
+    section?: string | null
+    article_no?: string | null
+    page_start?: number | null
+    page_end?: number | null
+    locator_json?: Record<string, any> | null
+}
+
+export interface DocumentDetail {
+    doc_id: string
+    title: string
+    doc_type: string
+    parse_status: string
+    chunks: number
+    created_at: string
+    original_file_name?: string | null
+    viewer_mode?: string | null
+    download_url?: string | null
+    text: string
+    chunk_items: DocumentDetailChunk[]
 }
 
 export interface CitationItem {
@@ -258,11 +300,30 @@ function withDefaults(request: ChatCompletionRequest): ChatCompletionRequest {
     }
 }
 
-export async function importDocument(file: File, sourceUrl?: string, docType?: string): Promise<DocImportResult> {
+async function buildMultipartError(response: Response): Promise<Error> {
+    const errorData = await response.json().catch(() => null)
+    const detail = errorData?.detail
+    const message =
+        typeof detail === 'string'
+            ? detail
+            : detail?.message || errorData?.message || '文档导入失败'
+    const error = new Error(message)
+    ;(error as any).status = response.status
+    if (detail && typeof detail === 'object' && typeof detail.code === 'string') {
+        ;(error as any).code = detail.code
+    }
+    if (detail && typeof detail === 'object' && detail.existing_doc) {
+        ;(error as any).existingDocument = detail.existing_doc as DuplicateDocumentInfo
+    }
+    return error
+}
+
+export async function importDocument(file: File, options: ImportDocumentOptions = {}): Promise<DocImportResult> {
     const formData = new FormData()
     formData.append('file', file)
-    if (sourceUrl) formData.append('source_url', sourceUrl)
-    if (docType) formData.append('doc_type', docType)
+    if (options.sourceUrl) formData.append('source_url', options.sourceUrl)
+    if (options.docType) formData.append('doc_type', options.docType)
+    if (options.overwriteDocId) formData.append('overwrite_doc_id', options.overwriteDocId)
 
     const response = await fetch(`${apiClient['baseUrl']}/api/v1/docs/import`, {
         method: 'POST',
@@ -270,8 +331,7 @@ export async function importDocument(file: File, sourceUrl?: string, docType?: s
     })
 
     if (!response.ok) {
-        const detail = await response.text()
-        throw new Error(detail || '文档导入失败')
+        throw await buildMultipartError(response)
     }
 
     const envelope = await response.json() as ApiEnvelope<DocImportResult>
@@ -286,6 +346,12 @@ export async function importDocuments(
         chunkSize?: number
         overlap?: number
         onProgress?: (progress: BatchImportProgress) => void
+        onDuplicate?: (payload: {
+            file: File
+            currentIndex: number
+            total: number
+            existingDocument: DuplicateDocumentInfo
+        }) => Promise<'overwrite' | 'skip'>
     } = {}
 ): Promise<BatchImportResult> {
     const normalizedFiles = files.filter((file): file is File => file instanceof File)
@@ -299,7 +365,61 @@ export async function importDocuments(
                 fileName: file.name,
                 stage: 'uploading',
             })
-            const imported = await importDocument(file, options.sourceUrl, options.docType)
+            let imported: DocImportResult
+            try {
+                imported = await importDocument(file, {
+                    sourceUrl: options.sourceUrl,
+                    docType: options.docType,
+                })
+            } catch (error: any) {
+                const existingDocument = error?.existingDocument as DuplicateDocumentInfo | undefined
+                const duplicateHandler = options.onDuplicate
+                const canConfirm =
+                    error?.status === 409 &&
+                    error?.code === 'DOCUMENT_ALREADY_EXISTS' &&
+                    existingDocument &&
+                    duplicateHandler
+
+                if (!canConfirm) {
+                    throw error
+                }
+
+                options.onProgress?.({
+                    total: normalizedFiles.length,
+                    currentIndex: index + 1,
+                    fileName: file.name,
+                    stage: 'awaiting_confirmation',
+                })
+                const decision = await duplicateHandler({
+                    file,
+                    currentIndex: index + 1,
+                    total: normalizedFiles.length,
+                    existingDocument,
+                })
+
+                if (decision === 'skip') {
+                    items.push({
+                        fileName: file.name,
+                        success: false,
+                        skipped: true,
+                        existingDocTitle: existingDocument.title,
+                        error: `已放弃覆盖《${existingDocument.title || file.name}》`,
+                    })
+                    continue
+                }
+
+                options.onProgress?.({
+                    total: normalizedFiles.length,
+                    currentIndex: index + 1,
+                    fileName: file.name,
+                    stage: 'uploading',
+                })
+                imported = await importDocument(file, {
+                    sourceUrl: options.sourceUrl,
+                    docType: options.docType,
+                    overwriteDocId: existingDocument.doc_id,
+                })
+            }
             options.onProgress?.({
                 total: normalizedFiles.length,
                 currentIndex: index + 1,
@@ -315,6 +435,7 @@ export async function importDocuments(
                 doc_type: imported.doc_type,
                 status: indexed.status,
                 chunks: indexed.chunks,
+                overwritten: imported.overwritten,
             })
         } catch (error: any) {
             items.push({
@@ -326,12 +447,15 @@ export async function importDocuments(
     }
 
     const successCount = items.filter((item) => item.success).length
+    const skippedCount = items.filter((item) => item.skipped).length
+    const failureCount = items.filter((item) => !item.success && !item.skipped).length
 
     return {
         items,
         total: normalizedFiles.length,
         successCount,
-        failureCount: items.length - successCount,
+        failureCount,
+        skippedCount,
     }
 }
 
@@ -346,6 +470,11 @@ export async function indexDocument(docId: string, chunkSize = 800, overlap = 20
 
 export async function getDocumentStatus(docId: string): Promise<DocStatusResult> {
     const envelope = await apiClient.get<ApiEnvelope<DocStatusResult>>(`/api/v1/docs/${docId}/status`)
+    return unwrap(envelope)
+}
+
+export async function getDocumentDetail(docId: string): Promise<DocumentDetail> {
+    const envelope = await apiClient.get<ApiEnvelope<DocumentDetail>>(`/api/v1/docs/${docId}/detail`)
     return unwrap(envelope)
 }
 

@@ -242,8 +242,17 @@ class LegalRagService:
             logger.warning("Chroma upsert 失败: %s", exc)
 
     # ─── 文档管理 (委托) ─────────────────────────────────
-    def import_document(self, file_name: str, content: bytes, doc_type=None, source_url=None):
-        return import_document(self.repo, file_name, content, doc_type, source_url)
+    def import_document(self, file_name: str, content: bytes, doc_type=None, source_url=None, overwrite_doc_id=None):
+        result = import_document(
+            self.repo,
+            file_name,
+            content,
+            doc_type,
+            source_url,
+            overwrite_doc_id=overwrite_doc_id,
+        )
+        self._reload_index_cache()
+        return result
 
     def build_index(self, doc_id, chunk_size=None, overlap=None, bm25_enabled=True, vector_enabled=True, embed_model=None):
         doc = self.repo.get_document(doc_id)
@@ -653,6 +662,40 @@ class LegalRagService:
                 "article_no": chunk.article_no,
                 "snippet": citation["payload"].get("snippet", ""),
             },
+        }
+
+    def get_document_detail(self, doc_id: str) -> Dict[str, Any]:
+        doc = self.repo.get_document(doc_id)
+        if doc is None:
+            raise KeyError("文档不存在")
+
+        chunk_items = self.repo.list_chunks(doc_id=doc_id)
+        return {
+            "doc_id": doc["doc_id"],
+            "title": doc["title"],
+            "doc_type": doc["doc_type"],
+            "parse_status": doc["parse_status"],
+            "chunks": doc.get("chunks", 0),
+            "created_at": doc["created_at"],
+            "original_file_name": doc.get("original_file_name"),
+            "viewer_mode": doc.get("viewer_mode") or "structured_text",
+            "download_url": f"{settings.API_PREFIX}/docs/{doc_id}/file" if doc.get("has_original_file") else None,
+            "text": doc.get("text", ""),
+            "chunk_items": [
+                {
+                    "chunk_id": chunk["chunk_id"],
+                    "chunk_index": chunk["chunk_index"],
+                    "chunk_text": chunk["chunk_text"],
+                    "start_pos": chunk["start_pos"],
+                    "end_pos": chunk["end_pos"],
+                    "section": chunk.get("section"),
+                    "article_no": chunk.get("article_no"),
+                    "page_start": chunk.get("page_start"),
+                    "page_end": chunk.get("page_end"),
+                    "locator_json": chunk.get("locator_json") or {},
+                }
+                for chunk in chunk_items
+            ],
         }
 
     # ─── 实验评测 ────────────────────────────────────────

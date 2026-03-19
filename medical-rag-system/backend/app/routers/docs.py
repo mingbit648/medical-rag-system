@@ -3,6 +3,7 @@ from typing import Optional
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 
+from app.core.doc_ingestion import DuplicateDocumentError
 from app.core.rag_engine import engine
 from app.models.schemas import IndexRequest
 from app.utils.response import make_trace_id, ok
@@ -20,6 +21,7 @@ async def import_doc(
     file: UploadFile = File(...),
     source_url: Optional[str] = Form(default=None),
     doc_type: Optional[str] = Form(default=None),
+    overwrite_doc_id: Optional[str] = Form(default=None),
 ):
     trace_id = make_trace_id()
     try:
@@ -31,8 +33,18 @@ async def import_doc(
             content=content,
             doc_type=doc_type,
             source_url=source_url,
+            overwrite_doc_id=overwrite_doc_id,
         )
         return ok(result, trace_id=trace_id)
+    except DuplicateDocumentError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "DOCUMENT_ALREADY_EXISTS",
+                "message": str(exc),
+                "existing_doc": exc.existing_doc,
+            },
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -90,6 +102,15 @@ async def get_doc_viewer_content(doc_id: str, citation_id: str = Query(...)):
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
         _raise_conflict(str(exc), code="ORIGINAL_VIEW_UNAVAILABLE")
+
+
+@router.get("/{doc_id}/detail")
+async def get_doc_detail(doc_id: str):
+    trace_id = make_trace_id()
+    try:
+        return ok(engine.get_document_detail(doc_id), trace_id=trace_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
 
 
 @router.get("")

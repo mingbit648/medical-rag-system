@@ -5,7 +5,9 @@ from __future__ import annotations
 import io
 import hashlib
 import mimetypes
+import shutil
 import uuid
+from datetime import date, datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -22,6 +24,13 @@ class ExtractedDocument:
     viewer_mode: str
     mime_type: str
     meta: Dict[str, Any]
+
+
+class DuplicateDocumentError(ValueError):
+    def __init__(self, existing_doc: Dict[str, Any]):
+        self.existing_doc = existing_doc
+        title = existing_doc.get("title") or existing_doc.get("original_file_name") or existing_doc.get("doc_id") or "该文档"
+        super().__init__(f"知识库已有《{title}》，请确认是否覆盖。")
 
 
 def guess_doc_type(file_name: str) -> str:
@@ -164,8 +173,20 @@ def _store_original_file(doc_id: str, file_name: str, content: bytes) -> str:
     return relative_path.as_posix()
 
 
+def _clear_original_file_dir(doc_id: str) -> None:
+    upload_dir = _resolve_upload_root().parent / "uploads" / doc_id
+    if upload_dir.exists():
+        shutil.rmtree(upload_dir, ignore_errors=True)
+
+
 def _source_fingerprint(content: bytes) -> str:
     return hashlib.sha1(content).hexdigest()
+
+
+def _jsonable_value(value: Any) -> Any:
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return value
 
 
 def import_document(
@@ -174,13 +195,37 @@ def import_document(
     content: bytes,
     doc_type: Optional[str] = None,
     source_url: Optional[str] = None,
+    overwrite_doc_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     resolved_type = (doc_type or guess_doc_type(file_name)).lower()
     extracted = extract_document(content, resolved_type, file_name)
     if not extracted.text.strip():
         raise ValueError("文档解析后为空，请检查文件格式。")
 
-    doc_id = f"doc_{uuid.uuid4().hex[:12]}"
+    fingerprint = _source_fingerprint(content)
+    overwrite_target = None
+    if overwrite_doc_id:
+        overwrite_target = repo.get_document(overwrite_doc_id, include_text=False)
+        if overwrite_target is None:
+            raise ValueError("要覆盖的文档不存在。")
+        doc_id = overwrite_doc_id
+        repo.clear_document_index(doc_id)
+        _clear_original_file_dir(doc_id)
+    else:
+        duplicate = repo.find_document_by_source_fingerprint(fingerprint)
+        if duplicate is not None:
+            raise DuplicateDocumentError(
+                {
+                    "doc_id": duplicate["doc_id"],
+                    "title": duplicate["title"],
+                    "doc_type": duplicate["doc_type"],
+                    "parse_status": duplicate["parse_status"],
+                    "chunks": duplicate.get("chunks", 0),
+                    "created_at": _jsonable_value(duplicate["created_at"]),
+                    "original_file_name": duplicate.get("original_file_name"),
+                }
+            )
+        doc_id = f"doc_{uuid.uuid4().hex[:12]}"
     stored_file_path = _store_original_file(doc_id, file_name, content)
     title = extract_title(file_name, extracted.text)
 
@@ -188,7 +233,7 @@ def import_document(
         "chunks": 0,
         "domain": "劳动法/通用",
         "source_version": 2,
-        "source_fingerprint": _source_fingerprint(content),
+        "source_fingerprint": fingerprint,
         "chunk_strategy_version": CHUNK_STRATEGY_VERSION,
         "semantic_chunking_enabled": False,
         "original_file_name": file_name,
@@ -212,4 +257,10 @@ def import_document(
         "meta": meta,
     }
     repo.upsert_document(payload)
-    return {"doc_id": doc_id, "title": title, "doc_type": resolved_type, "status": "imported"}
+    return {
+        "doc_id": doc_id,
+        "title": title,
+        "doc_type": resolved_type,
+        "status": "imported",
+        "overwritten": overwrite_target is not None,
+    }
