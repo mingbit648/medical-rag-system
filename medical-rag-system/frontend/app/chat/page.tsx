@@ -770,40 +770,35 @@ export default function ChatPage() {
 
                     <footer className="chat-input-area">
                         <div className="chat-input-panel">
-                            <div className="chat-input-surface">
-                                <div className="chat-input-copy">
-                                    <span className="chat-input-kicker">COMPOSE</span>
-                                    <span className="chat-input-meta">
-                                        {streaming ? '智能体正在生成回复' : 'Enter 发送 · Shift + Enter 换行'}
-                                    </span>
+                            <div className="chat-composer">
+                                <div className="chat-input-inner">
+                                    <div className="chat-input-editor">
+                                        <TextArea
+                                            value={inputValue}
+                                            onChange={(e) => setComposerValue(e.target.value)}
+                                            onPressEnter={(e) => {
+                                                if (!e.shiftKey) {
+                                                    e.preventDefault()
+                                                    void handleSend()
+                                                }
+                                            }}
+                                            placeholder="输入问题"
+                                            autoSize={{ minRows: 1, maxRows: 8 }}
+                                            disabled={bootstrapping || streaming || (activeView.kind === 'session' && !activeConversation)}
+                                            style={{ resize: 'none' }}
+                                        />
+                                    </div>
+                                    <button
+                                        type="button"
+                                        className="chat-send-btn"
+                                        onClick={() => void handleSend()}
+                                        disabled={!inputValue.trim() || bootstrapping || streaming || (activeView.kind === 'session' && !activeConversation)}
+                                        aria-label="发送消息"
+                                    >
+                                        <SendOutlined />
+                                    </button>
                                 </div>
-                            <div className="chat-input-inner">
-                                <div className="chat-input-editor">
-                                <TextArea
-                                    value={inputValue}
-                                    onChange={(e) => setComposerValue(e.target.value)}
-                                    onPressEnter={(e) => {
-                                        if (!e.shiftKey) {
-                                            e.preventDefault()
-                                            void handleSend()
-                                        }
-                                    }}
-                                    placeholder="输入问题"
-                                    autoSize={{ minRows: 1, maxRows: 8 }}
-                                    disabled={bootstrapping || streaming || (activeView.kind === 'session' && !activeConversation)}
-                                    style={{ resize: 'none' }}
-                                />
-                                </div>
-                                <button
-                                    type="button"
-                                    className="chat-send-btn"
-                                    onClick={() => void handleSend()}
-                                    disabled={!inputValue.trim() || bootstrapping || streaming || (activeView.kind === 'session' && !activeConversation)}
-                                    aria-label="发送消息"
-                                >
-                                    <SendOutlined />
-                                </button>
-                            </div>
+                                <div className="chat-input-hint">{streaming ? '正在生成回复' : 'Enter 发送 · Shift + Enter 换行'}</div>
                             </div>
                         </div>
                     </footer>
