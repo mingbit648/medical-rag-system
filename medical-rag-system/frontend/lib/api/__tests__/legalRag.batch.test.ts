@@ -34,18 +34,16 @@ function makeDuplicateErrorEnvelope(docId: string, title: string) {
     }
 }
 
-function makeIndexEnvelope(docId: string, chunks: number) {
+function makeIndexEnvelope(docId: string, jobId: string, kbId = 'kb_default') {
     return {
         code: 0,
         message: 'ok',
         data: {
+            job_id: jobId,
             doc_id: docId,
-            status: 'indexed',
-            chunks,
-            chunk: {
-                size: 800,
-                overlap: 200,
-            },
+            kb_id: kbId,
+            status: 'indexing',
+            parse_status: 'indexing',
         },
         trace_id: `trace_index_${docId}`,
     }
@@ -59,29 +57,29 @@ describe('importDocuments', () => {
         global.fetch = originalFetch
     })
 
-    test('imports and indexes files sequentially while reporting progress', async () => {
+    test('imports files sequentially and queues indexing while reporting progress', async () => {
         const fetchMock = jest.fn()
         global.fetch = fetchMock as typeof fetch
         fetchMock
             .mockResolvedValueOnce({
                 ok: true,
-                json: async () => makeImportEnvelope('doc_alpha', '劳动合同.pdf'),
+                json: async () => makeImportEnvelope('doc_alpha', 'alpha.pdf'),
             } as Response)
             .mockResolvedValueOnce({
                 ok: true,
-                json: async () => makeImportEnvelope('doc_beta', '规章制度.txt', 'text'),
+                json: async () => makeImportEnvelope('doc_beta', 'beta.txt', 'text'),
             } as Response)
 
         const postSpy = jest
             .spyOn(apiClient, 'post')
-            .mockResolvedValueOnce(makeIndexEnvelope('doc_alpha', 3))
-            .mockResolvedValueOnce(makeIndexEnvelope('doc_beta', 5))
+            .mockResolvedValueOnce(makeIndexEnvelope('doc_alpha', 'job_alpha'))
+            .mockResolvedValueOnce(makeIndexEnvelope('doc_beta', 'job_beta'))
 
         const onProgress = jest.fn()
         const result = await importDocuments(
             [
-                new File(['alpha'], '劳动合同.pdf', { type: 'application/pdf' }),
-                new File(['beta'], '规章制度.txt', { type: 'text/plain' }),
+                new File(['alpha'], 'alpha.pdf', { type: 'application/pdf' }),
+                new File(['beta'], 'beta.txt', { type: 'text/plain' }),
             ],
             { onProgress }
         )
@@ -98,16 +96,26 @@ describe('importDocuments', () => {
         expect(result).toEqual({
             items: [
                 expect.objectContaining({
-                    fileName: '劳动合同.pdf',
+                    fileName: 'alpha.pdf',
                     success: true,
                     doc_id: 'doc_alpha',
-                    chunks: 3,
+                    status: 'indexing',
+                    latestJob: {
+                        job_id: 'job_alpha',
+                        status: 'indexing',
+                        attempts: 0,
+                    },
                 }),
                 expect.objectContaining({
-                    fileName: '规章制度.txt',
+                    fileName: 'beta.txt',
                     success: true,
                     doc_id: 'doc_beta',
-                    chunks: 5,
+                    status: 'indexing',
+                    latestJob: {
+                        job_id: 'job_beta',
+                        status: 'indexing',
+                        attempts: 0,
+                    },
                 }),
             ],
             total: 2,
@@ -116,14 +124,14 @@ describe('importDocuments', () => {
             skippedCount: 0,
         })
         expect(onProgress.mock.calls).toEqual([
-            [{ total: 2, currentIndex: 1, fileName: '劳动合同.pdf', stage: 'uploading' }],
-            [{ total: 2, currentIndex: 1, fileName: '劳动合同.pdf', stage: 'indexing' }],
-            [{ total: 2, currentIndex: 2, fileName: '规章制度.txt', stage: 'uploading' }],
-            [{ total: 2, currentIndex: 2, fileName: '规章制度.txt', stage: 'indexing' }],
+            [{ total: 2, currentIndex: 1, fileName: 'alpha.pdf', stage: 'uploading' }],
+            [{ total: 2, currentIndex: 1, fileName: 'alpha.pdf', stage: 'indexing' }],
+            [{ total: 2, currentIndex: 2, fileName: 'beta.txt', stage: 'uploading' }],
+            [{ total: 2, currentIndex: 2, fileName: 'beta.txt', stage: 'indexing' }],
         ])
     })
 
-    test('continues remaining files after a failure and records the error', async () => {
+    test('continues remaining files after queueing failure and records the error', async () => {
         const fetchMock = jest.fn()
         global.fetch = fetchMock as typeof fetch
         fetchMock
@@ -138,7 +146,7 @@ describe('importDocuments', () => {
 
         jest.spyOn(apiClient, 'post')
             .mockRejectedValueOnce(new Error('索引失败'))
-            .mockResolvedValueOnce(makeIndexEnvelope('doc_beta', 4))
+            .mockResolvedValueOnce(makeIndexEnvelope('doc_beta', 'job_beta'))
 
         const result = await importDocuments(
             [
@@ -161,7 +169,12 @@ describe('importDocuments', () => {
                 fileName: 'beta.pdf',
                 success: true,
                 doc_id: 'doc_beta',
-                chunks: 4,
+                status: 'indexing',
+                latestJob: {
+                    job_id: 'job_beta',
+                    status: 'indexing',
+                    attempts: 0,
+                },
             }),
         ])
     })
@@ -172,7 +185,7 @@ describe('importDocuments', () => {
         fetchMock.mockResolvedValueOnce({
             ok: false,
             status: 409,
-            json: async () => makeDuplicateErrorEnvelope('doc_existing', '员工手册'),
+            json: async () => makeDuplicateErrorEnvelope('doc_existing', 'employee-handbook'),
         } as Response)
 
         const postSpy = jest.spyOn(apiClient, 'post')
@@ -180,7 +193,7 @@ describe('importDocuments', () => {
         const onProgress = jest.fn()
 
         const result = await importDocuments(
-            [new File(['duplicate'], '员工手册.pdf', { type: 'application/pdf' })],
+            [new File(['duplicate'], 'employee-handbook.pdf', { type: 'application/pdf' })],
             { onDuplicate, onProgress }
         )
 
@@ -188,18 +201,18 @@ describe('importDocuments', () => {
             expect.objectContaining({
                 currentIndex: 1,
                 total: 1,
-                existingDocument: expect.objectContaining({ doc_id: 'doc_existing', title: '员工手册' }),
+                existingDocument: expect.objectContaining({ doc_id: 'doc_existing', title: 'employee-handbook' }),
             })
         )
         expect(postSpy).not.toHaveBeenCalled()
         expect(result).toEqual({
             items: [
                 expect.objectContaining({
-                    fileName: '员工手册.pdf',
+                    fileName: 'employee-handbook.pdf',
                     success: false,
                     skipped: true,
-                    existingDocTitle: '员工手册',
-                    error: '已放弃覆盖《员工手册》',
+                    existingDocTitle: 'employee-handbook',
+                    error: '已放弃覆盖《employee-handbook》',
                 }),
             ],
             total: 1,
@@ -208,8 +221,8 @@ describe('importDocuments', () => {
             skippedCount: 1,
         })
         expect(onProgress.mock.calls).toEqual([
-            [{ total: 1, currentIndex: 1, fileName: '员工手册.pdf', stage: 'uploading' }],
-            [{ total: 1, currentIndex: 1, fileName: '员工手册.pdf', stage: 'awaiting_confirmation' }],
+            [{ total: 1, currentIndex: 1, fileName: 'employee-handbook.pdf', stage: 'uploading' }],
+            [{ total: 1, currentIndex: 1, fileName: 'employee-handbook.pdf', stage: 'awaiting_confirmation' }],
         ])
     })
 
@@ -220,31 +233,35 @@ describe('importDocuments', () => {
             .mockResolvedValueOnce({
                 ok: false,
                 status: 409,
-                json: async () => makeDuplicateErrorEnvelope('doc_existing', '规章制度'),
+                json: async () => makeDuplicateErrorEnvelope('doc_existing', 'policy'),
             } as Response)
             .mockResolvedValueOnce({
                 ok: true,
-                json: async () => makeImportEnvelope('doc_existing', '规章制度', 'pdf', true),
+                json: async () => makeImportEnvelope('doc_existing', 'policy', 'pdf', true),
             } as Response)
 
-        const postSpy = jest.spyOn(apiClient, 'post').mockResolvedValueOnce(makeIndexEnvelope('doc_existing', 8))
+        const postSpy = jest.spyOn(apiClient, 'post').mockResolvedValueOnce(makeIndexEnvelope('doc_existing', 'job_existing'))
         const onDuplicate = jest.fn().mockResolvedValue('overwrite')
 
-        const result = await importDocuments(
-            [new File(['duplicate'], '规章制度.pdf', { type: 'application/pdf' })],
-            { onDuplicate }
-        )
+        const result = await importDocuments([new File(['duplicate'], 'policy.pdf', { type: 'application/pdf' })], {
+            onDuplicate,
+        })
 
         expect(fetchMock).toHaveBeenCalledTimes(2)
         expect(postSpy).toHaveBeenCalledTimes(1)
         expect(result).toEqual({
             items: [
                 expect.objectContaining({
-                    fileName: '规章制度.pdf',
+                    fileName: 'policy.pdf',
                     success: true,
                     doc_id: 'doc_existing',
-                    chunks: 8,
+                    status: 'indexing',
                     overwritten: true,
+                    latestJob: {
+                        job_id: 'job_existing',
+                        status: 'indexing',
+                        attempts: 0,
+                    },
                 }),
             ],
             total: 1,

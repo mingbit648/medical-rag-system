@@ -5,7 +5,16 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
 from app.core.rag_engine import get_engine
-from app.routers import chat, citations, docs, experiments, retrieve
+from app.routers import auth, chat, citations, docs, experiments, knowledge_bases, retrieve
+
+
+def _cors_allow_origins() -> list[str]:
+    raw = (settings.CORS_ALLOW_ORIGINS or "").strip()
+    if not raw:
+        return []
+    if raw == "*":
+        raise RuntimeError("认证接口启用 Cookie Session 时，CORS_ALLOW_ORIGINS 不能配置为 *")
+    return [item.strip() for item in raw.split(",") if item.strip()]
 
 
 @asynccontextmanager
@@ -18,14 +27,14 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="法律辅助咨询 RAG API",
-    version="0.1.0",
-    description="基于混合检索 + 重排序的最小可运行工程壳。",
+    version="0.2.0",
+    description="基于混合检索与 Cookie Session 认证的多用户法律知识库系统。",
     lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"] if settings.CORS_ALLOW_ORIGINS == "*" else settings.CORS_ALLOW_ORIGINS.split(","),
+    allow_origins=_cors_allow_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -38,10 +47,12 @@ def health_check():
         "status": "ok",
         "app": settings.APP_NAME,
         "version": app.version,
-        "mode": "minimal-shell",
+        "mode": "multi-user",
     }
 
 
+app.include_router(auth.router, prefix=f"{settings.API_PREFIX}/auth", tags=["auth"])
+app.include_router(knowledge_bases.router, prefix=f"{settings.API_PREFIX}/knowledge-bases", tags=["knowledge-bases"])
 app.include_router(docs.router, prefix=f"{settings.API_PREFIX}/docs", tags=["docs"])
 app.include_router(chat.router, prefix=f"{settings.API_PREFIX}/chat", tags=["chat"])
 app.include_router(retrieve.router, prefix=f"{settings.API_PREFIX}/retrieve", tags=["retrieve"])

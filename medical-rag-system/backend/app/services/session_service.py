@@ -43,11 +43,13 @@ class SessionService:
     def __init__(self, repo: PgRepository):
         self.repo = repo
 
-    def create_session(self, title: Optional[str] = None) -> Dict[str, Any]:
+    def create_session(self, user_id: str, kb_id: str, title: Optional[str] = None) -> Dict[str, Any]:
         session_id = f"s_{uuid.uuid4().hex[:12]}"
         now = now_iso()
         return self.repo.create_session(
             session_id=session_id,
+            user_id=user_id,
+            kb_id=kb_id,
             title=(title or DEFAULT_SESSION_TITLE).strip() or DEFAULT_SESSION_TITLE,
             created_at=now,
             updated_at=now,
@@ -57,22 +59,22 @@ class SessionService:
             meta_json={"preview": "", "last_message_role": None},
         )
 
-    def list_sessions(self, limit: int = 20, status: Optional[str] = "active") -> List[Dict[str, Any]]:
-        return self.repo.list_sessions(limit=limit, status=status)
+    def list_sessions(self, user_id: str, kb_id: str, limit: int = 20, status: Optional[str] = "active") -> List[Dict[str, Any]]:
+        return self.repo.list_sessions(user_id=user_id, kb_id=kb_id, limit=limit, status=status)
 
-    def get_session(self, session_id: str) -> Dict[str, Any]:
-        session = self.repo.get_session(session_id)
+    def get_session(self, user_id: str, session_id: str) -> Dict[str, Any]:
+        session = self.repo.get_session(session_id, user_id=user_id)
         if session is None:
             raise SessionNotFoundError("会话不存在")
         return session
 
-    def get_session_detail(self, session_id: str, message_limit: int = 50) -> Dict[str, Any]:
+    def get_session_detail(self, user_id: str, session_id: str, message_limit: int = 50) -> Dict[str, Any]:
         with self.repo.transaction() as cur:
-            session = self.repo._get_session(cur, session_id, for_update=True)
+            session = self.repo._get_session(cur, session_id, user_id=user_id, for_update=True)
             if session is None:
                 raise SessionNotFoundError("会话不存在")
             self._repair_stale_streams(cur, session)
-            session = self.repo._get_session(cur, session_id, for_update=False)
+            session = self.repo._get_session(cur, session_id, user_id=user_id, for_update=False)
             messages = self.repo._list_messages(
                 cur,
                 session_id=session_id,
@@ -83,9 +85,9 @@ class SessionService:
             snapshot = self.repo._get_active_context_snapshot(cur, session_id)
             return {"session": session, "messages": messages, "active_summary": snapshot}
 
-    def list_messages(self, session_id: str, limit: int = 50, before_seq: Optional[int] = None) -> List[Dict[str, Any]]:
+    def list_messages(self, user_id: str, session_id: str, limit: int = 50, before_seq: Optional[int] = None) -> List[Dict[str, Any]]:
         with self.repo.transaction() as cur:
-            session = self.repo._get_session(cur, session_id, for_update=True)
+            session = self.repo._get_session(cur, session_id, user_id=user_id, for_update=True)
             if session is None:
                 raise SessionNotFoundError("会话不存在")
             self._repair_stale_streams(cur, session)
@@ -98,12 +100,12 @@ class SessionService:
                 include_citations=True,
             )
 
-    def update_session(self, session_id: str, *, title: Optional[str] = None, status: Optional[str] = None) -> Dict[str, Any]:
+    def update_session(self, user_id: str, session_id: str, *, title: Optional[str] = None, status: Optional[str] = None) -> Dict[str, Any]:
         normalized_status = status.strip().lower() if status else None
         if normalized_status and normalized_status not in {"active", "archived", "deleted"}:
             raise ValueError("status 仅支持 active / archived / deleted")
 
-        session = self.get_session(session_id)
+        session = self.get_session(user_id, session_id)
         next_title = title.strip() if title else None
         if next_title == "":
             raise ValueError("title 不能为空")
@@ -120,8 +122,8 @@ class SessionService:
             raise SessionNotFoundError("会话不存在")
         return updated
 
-    def delete_session(self, session_id: str) -> Dict[str, Any]:
-        session = self.get_session(session_id)
+    def delete_session(self, user_id: str, session_id: str) -> Dict[str, Any]:
+        session = self.get_session(user_id, session_id)
         deleted = self.repo.update_session(
             session_id=session_id,
             status="deleted",
@@ -133,7 +135,7 @@ class SessionService:
             raise SessionNotFoundError("会话不存在")
         return deleted
 
-    def start_turn(self, *, session_id: Optional[str], query: str, request_id: Optional[str] = None) -> TurnStartContext:
+    def start_turn(self, *, user_id: str, kb_id: Optional[str], session_id: Optional[str], query: str, request_id: Optional[str] = None) -> TurnStartContext:
         now = now_iso()
         normalized_query = query.strip()
         if not normalized_query:
@@ -144,14 +146,18 @@ class SessionService:
             effective_request_id = f"req_{uuid.uuid4().hex[:16]}"
 
         with self.repo.transaction() as cur:
-            session = self.repo._get_session(cur, session_id, for_update=True) if session_id else None
+            session = self.repo._get_session(cur, session_id, user_id=user_id, for_update=True) if session_id else None
             if session_id and session is None:
                 raise SessionNotFoundError("会话不存在")
             if session is None:
+                if not kb_id:
+                    raise ValueError("新会话必须绑定知识库")
                 session_id = f"s_{uuid.uuid4().hex[:12]}"
                 self.repo._insert_session(
                     cur,
                     session_id=session_id,
+                    user_id=user_id,
+                    kb_id=kb_id,
                     title=self._derive_title(normalized_query),
                     created_at=now,
                     updated_at=now,
@@ -160,7 +166,9 @@ class SessionService:
                     status="active",
                     meta_json={"preview": "", "last_message_role": None},
                 )
-                session = self.repo._get_session(cur, session_id, for_update=True)
+                session = self.repo._get_session(cur, session_id, user_id=user_id, for_update=True)
+            elif kb_id and session.get("kb_id") != kb_id:
+                raise SessionStateError("当前会话已绑定其他知识库，请新建会话后再提问")
 
             if session is None:
                 raise SessionNotFoundError("会话不存在")

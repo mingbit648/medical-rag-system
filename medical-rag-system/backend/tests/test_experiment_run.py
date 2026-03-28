@@ -3,6 +3,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.rag_engine import LegalRagService
@@ -12,6 +14,7 @@ from app.core.text_utils import ChunkRecord
 class FakeExperimentRepo:
     def __init__(self):
         self.saved_run = None
+        self.kb = {"kb_id": "kb_experiment", "name": "实验知识库"}
         self.docs = [
             {
                 "doc_id": "doc_law",
@@ -22,12 +25,20 @@ class FakeExperimentRepo:
             }
         ]
 
-    def list_documents(self, *, include_text=True):
+    def get_knowledge_base(self, kb_id):
+        if kb_id != self.kb["kb_id"]:
+            return None
+        return self.kb
+
+    def list_documents(self, *, include_text=True, kb_id=None):
+        if kb_id and kb_id != self.kb["kb_id"]:
+            return []
         return list(self.docs)
 
-    def save_run(self, run_id, mode, config, metrics, created_at):
+    def save_run(self, run_id, kb_id, mode, config, metrics, created_at):
         self.saved_run = {
             "run_id": run_id,
+            "kb_id": kb_id,
             "mode": mode,
             "config": config,
             "metrics": metrics,
@@ -59,15 +70,20 @@ class ExperimentRunTests(unittest.TestCase):
                 article_no="第二条",
             ),
         }
-        service.chunk_terms = {}
+        service.chunk_terms = {
+            "chk_bm": ["第一条", "平等就业"],
+            "chk_vec": ["第二条", "劳动报酬"],
+        }
         service.doc_chunk_ids = {"doc_law": ["chk_bm", "chk_vec"]}
+        service.kb_chunk_ids = {"kb_experiment": ["chk_bm", "chk_vec"]}
         service.bm25_enabled = True
         service.vector_enabled = True
         service.bm25_index = object()
         service.bm25_chunk_ids = ["chk_bm", "chk_vec"]
         service.embedding_service = type("Embedding", (), {"name": "hash-256"})()
         service.vector_chunk_ids = ["chk_vec", "chk_bm"]
-        service.vector_matrix = None
+        service.vector_matrix = np.ones((2, 1), dtype=np.float32)
+        service.vector_chunk_index = {"chk_vec": 0, "chk_bm": 1}
         service.chroma_collection = None
         service._cross_encoder_state = {"model": None, "disabled": False}
         service.cross_encoder_model_name = "cross-encoder/mock"
@@ -105,6 +121,7 @@ class ExperimentRunTests(unittest.TestCase):
         service = self._make_service()
 
         result = service.run_experiment(
+            kb_id="kb_experiment",
             dataset=[
                 {
                     "case_id": "case_01",
@@ -130,6 +147,7 @@ class ExperimentRunTests(unittest.TestCase):
         self.assertEqual(result["metrics"]["groups"]["hybrid_rerank"]["mrr"], 1.0)
         self.assertAlmostEqual(result["metrics"]["groups"]["bm25_only"]["mrr"], 0.5, places=4)
         self.assertIsNotNone(service.repo.saved_run)
+        self.assertEqual(service.repo.saved_run["kb_id"], "kb_experiment")
         self.assertEqual(service.repo.saved_run["config"]["corpus_version"], result["config"]["corpus_version"])
 
     def test_evaluate_experiment_group_falls_back_to_doc_labels(self):

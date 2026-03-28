@@ -1,3 +1,3 @@
-from . import chat, citations, docs, experiments, retrieve
+from . import auth, chat, citations, docs, experiments, knowledge_bases, retrieve
 
-__all__ = ["chat", "citations", "docs", "experiments", "retrieve"]
+__all__ = ["auth", "chat", "citations", "docs", "experiments", "knowledge_bases", "retrieve"]

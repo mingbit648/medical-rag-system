@@ -2,6 +2,7 @@ import type { Metadata, Viewport } from 'next'
 import { AntdRegistry } from '@ant-design/nextjs-registry'
 import './globals.css'
 import AntdConfig from './antd-config'
+import { AppSessionProvider } from '@/lib/session/AppSessionProvider'
 
 export const metadata: Metadata = {
     title: '法律辅助咨询 RAG 系统 - 基于混合检索的智能法律信息检索',
@@ -38,7 +39,9 @@ export default function RootLayout({
         <html lang="zh-CN" suppressHydrationWarning>
             <body className="antialiased" suppressHydrationWarning>
                 <AntdRegistry>
-                    <AntdConfig>{children}</AntdConfig>
+                    <AntdConfig>
+                        <AppSessionProvider>{children}</AppSessionProvider>
+                    </AntdConfig>
                 </AntdRegistry>
             </body>
         </html>

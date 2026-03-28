@@ -1,6 +1,7 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
-from app.core.rag_engine import engine
+from app.core.rag_engine import get_engine
+from app.dependencies import require_admin, require_kb_read_access
 from app.models.schemas import RetrieveDebugRequest
 from app.utils.response import make_trace_id, ok
 
@@ -9,22 +10,25 @@ router = APIRouter()
 
 
 @router.post("/debug")
-async def retrieve_debug(request: RetrieveDebugRequest):
+async def retrieve_debug(payload: RetrieveDebugRequest, user=Depends(require_admin)):
     trace_id = make_trace_id()
+    require_kb_read_access(user, payload.kb_id)
     try:
-        result = engine.retrieve(
-            query=request.query,
-            bm25_topn=request.topn.bm25,
-            vector_topn=request.topn.vector,
-            fusion_k=request.fusion.k,
-            rerank_topk=request.rerank.topk,
-            rerank_topm=request.rerank.topm,
+        result = get_engine().retrieve(
+            query=payload.query,
+            kb_id=payload.kb_id,
+            bm25_topn=payload.topn.bm25,
+            vector_topn=payload.topn.vector,
+            fusion_k=payload.fusion.k,
+            rerank_topk=payload.rerank.topk,
+            rerank_topm=payload.rerank.topm,
             save_citations=False,
             generate_answer_flag=False,
         )
         return ok(
             {
-                "query": request.query,
+                "query": payload.query,
+                "kb_id": payload.kb_id,
                 "bm25": result["debug"]["bm25"],
                 "vector": result["debug"]["vector"],
                 "fusion": result["debug"]["fusion"],

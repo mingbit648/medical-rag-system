@@ -1,3 +1,10 @@
+from .auth_service import (
+    AuthConflictError,
+    AuthError,
+    AuthForbiddenError,
+    AuthService,
+    AuthUnauthorizedError,
+)
 from .session_service import (
     DuplicateRequestError,
     SessionBusyError,
@@ -8,6 +15,11 @@ from .session_service import (
 )
 
 __all__ = [
+    "AuthConflictError",
+    "AuthError",
+    "AuthForbiddenError",
+    "AuthService",
+    "AuthUnauthorizedError",
     "DuplicateRequestError",
     "SessionBusyError",
     "SessionNotFoundError",

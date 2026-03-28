@@ -191,6 +191,8 @@ def _jsonable_value(value: Any) -> Any:
 
 def import_document(
     repo,
+    kb_id: str,
+    uploaded_by: Optional[str],
     file_name: str,
     content: bytes,
     doc_type: Optional[str] = None,
@@ -205,14 +207,14 @@ def import_document(
     fingerprint = _source_fingerprint(content)
     overwrite_target = None
     if overwrite_doc_id:
-        overwrite_target = repo.get_document(overwrite_doc_id, include_text=False)
+        overwrite_target = repo.get_document(overwrite_doc_id, include_text=False, kb_id=kb_id)
         if overwrite_target is None:
             raise ValueError("要覆盖的文档不存在。")
         doc_id = overwrite_doc_id
         repo.clear_document_index(doc_id)
         _clear_original_file_dir(doc_id)
     else:
-        duplicate = repo.find_document_by_source_fingerprint(fingerprint)
+        duplicate = repo.find_document_by_source_fingerprint(kb_id, fingerprint)
         if duplicate is not None:
             raise DuplicateDocumentError(
                 {
@@ -244,11 +246,13 @@ def import_document(
     }
     payload = {
         "doc_id": doc_id,
+        "kb_id": kb_id,
         "title": title,
         "doc_type": resolved_type,
         "source_url": source_url,
         "file_name": file_name,
         "file_path": stored_file_path,
+        "uploaded_by": uploaded_by,
         "content_text": extracted.text,
         "text": extracted.text,
         "created_at": now_iso(),

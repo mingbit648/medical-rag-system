@@ -46,6 +46,7 @@ class LLMOption(BaseModel):
 
 class ChatCompletionRequest(BaseModel):
     session_id: Optional[str] = None
+    kb_id: Optional[str] = None
     request_id: Optional[str] = None
     query: str = Field(min_length=1)
     topn: TopNOption = TopNOption()
@@ -55,6 +56,7 @@ class ChatCompletionRequest(BaseModel):
 
 
 class ChatSessionCreateRequest(BaseModel):
+    kb_id: str = Field(min_length=1)
     title: Optional[str] = None
 
 
@@ -73,6 +75,7 @@ class ChatSessionMessageRequest(BaseModel):
 
 
 class RetrieveDebugRequest(BaseModel):
+    kb_id: str = Field(min_length=1)
     query: str = Field(min_length=1)
     topn: TopNOption = TopNOption()
     fusion: FusionOption = FusionOption()
@@ -88,11 +91,34 @@ class ExperimentCase(BaseModel):
 
 
 class ExperimentRunRequest(BaseModel):
+    kb_id: str = Field(min_length=1)
     dataset: List[ExperimentCase] = Field(min_length=1)
     dataset_version: Optional[str] = None
     topn: TopNOption = TopNOption()
     fusion: FusionOption = FusionOption()
     rerank: RerankOption = RerankOption()
+
+
+class AuthRegisterRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=200)
+    password: str = Field(min_length=8, max_length=200)
+    display_name: Optional[str] = Field(default=None, max_length=100)
+
+
+class AuthLoginRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=200)
+    password: str = Field(min_length=1, max_length=200)
+
+
+class KnowledgeBaseCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: Optional[str] = Field(default=None, max_length=500)
+
+
+class KnowledgeBaseUpdateRequest(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    description: Optional[str] = Field(default=None, max_length=500)
+    status: Optional[str] = Field(default=None, max_length=20)
 
 
 class ApiEnvelope(BaseModel):

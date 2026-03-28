@@ -1,8 +1,19 @@
-import { buildFallbackSessionSummary, remapOptimisticMessages, resolveInitialActiveView, sortChatMessages, upsertConversation, type ChatMessage, type ConversationRecord } from '@/lib/chat/sessionState'
+import {
+    buildFallbackSessionSummary,
+    remapOptimisticMessages,
+    resolveInitialActiveView,
+    sortChatMessages,
+    upsertConversation,
+    type ChatMessage,
+    type ConversationRecord,
+} from '@/lib/chat/sessionState'
+
 
 function makeConversation(sessionId: string, updatedAt: string): ConversationRecord {
     return {
         session_id: sessionId,
+        kb_id: 'kb_1',
+        kb_name: '测试知识库',
         title: sessionId,
         status: 'active',
         preview: '',
@@ -15,6 +26,7 @@ function makeConversation(sessionId: string, updatedAt: string): ConversationRec
         loaded: true,
     }
 }
+
 
 describe('chat session state helpers', () => {
     test('resolveInitialActiveView falls back to draft when no persisted sessions exist', () => {
@@ -47,7 +59,14 @@ describe('chat session state helpers', () => {
             })
         ).toEqual([
             { id: 'msg_user_real', role: 'user', content: '你好', timestamp: 1, status: 'completed' },
-            { id: 'msg_assistant_real', role: 'assistant', content: '已生成', timestamp: 2, status: 'completed', citations: undefined },
+            {
+                id: 'msg_assistant_real',
+                role: 'assistant',
+                content: '已生成',
+                timestamp: 2,
+                status: 'completed',
+                citations: undefined,
+            },
         ])
     })
 
@@ -61,12 +80,13 @@ describe('chat session state helpers', () => {
     })
 
     test('buildFallbackSessionSummary derives a persisted summary from the first query', () => {
-        const summary = buildFallbackSessionSummary('s_created', '公司拖欠工资怎么办', Date.UTC(2026, 2, 15, 0, 0, 0))
+        const summary = buildFallbackSessionSummary('s_created', '公司拖欠工资怎么办？', Date.UTC(2026, 2, 15, 0, 0, 0), 'kb_1')
 
         expect(summary).toMatchObject({
             session_id: 's_created',
-            title: '公司拖欠工资怎么办',
-            preview: '公司拖欠工资怎么办',
+            kb_id: 'kb_1',
+            title: '公司拖欠工资怎么办？',
+            preview: '公司拖欠工资怎么办？',
             message_count: 2,
             status: 'active',
         })

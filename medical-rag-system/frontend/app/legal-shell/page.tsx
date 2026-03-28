@@ -1,6 +1,8 @@
 'use client'
 
 import { useMemo, useState } from 'react'
+import AuthGuard from '@/components/AuthGuard'
+import { useAppSession } from '@/lib/session/AppSessionProvider'
 import {
     chatCompletion,
     chatCompletionStream,
@@ -47,6 +49,7 @@ function toHighlightPieces(view: CitationViewData | null): HighlightPieces | nul
 }
 
 export default function LegalShellPage() {
+    const { currentKnowledgeBase, currentKnowledgeBaseId } = useAppSession()
     const [file, setFile] = useState<File | null>(null)
     const [docId, setDocId] = useState('')
     const [query, setQuery] = useState('公司拖欠工资怎么办？')
@@ -60,7 +63,7 @@ export default function LegalShellPage() {
     const [loading, setLoading] = useState(false)
     const [streaming, setStreaming] = useState(false)
 
-    const canAsk = useMemo(() => Boolean(query.trim()), [query])
+    const canAsk = useMemo(() => Boolean(query.trim()) && Boolean(sessionId || currentKnowledgeBaseId), [query, sessionId, currentKnowledgeBaseId])
     const highlight = useMemo(() => toHighlightPieces(citationView), [citationView])
 
     async function handleImportAndIndex() {
@@ -68,17 +71,21 @@ export default function LegalShellPage() {
             setStatusText('请先选择 PDF/HTML/TXT 文件')
             return
         }
+        if (!currentKnowledgeBaseId) {
+            setStatusText('请先选择当前知识库')
+            return
+        }
         setLoading(true)
         try {
             setStatusText('导入中...')
-            const imported = await importDocument(file)
+            const imported = await importDocument(file, { kbId: currentKnowledgeBaseId })
             setDocId(imported.doc_id)
 
-            setStatusText('建索引中...')
+            setStatusText('提交索引任务中...')
             await indexDocument(imported.doc_id)
 
             const status = await getDocumentStatus(imported.doc_id)
-            setStatusText(`完成: ${status.title}（chunks=${status.chunks}）`)
+            setStatusText(`索引任务已提交: ${status.title}（status=${status.parse_status}）`)
         } catch (error: any) {
             setStatusText(`失败: ${error.message || '未知错误'}`)
         } finally {
@@ -87,10 +94,17 @@ export default function LegalShellPage() {
     }
 
     async function handleAskBlocking() {
-        if (!canAsk) return
+        if (!canAsk) {
+            setStatusText('请先选择知识库后再提问')
+            return
+        }
         setLoading(true)
         try {
-            const data = await chatCompletion({ session_id: sessionId || undefined, query })
+            const data = await chatCompletion({
+                session_id: sessionId || undefined,
+                kb_id: sessionId ? undefined : currentKnowledgeBaseId || undefined,
+                query,
+            })
             setSessionId(data.session_id)
             setAnswer(data.answer_md)
             setCitations(data.citations)
@@ -103,7 +117,12 @@ export default function LegalShellPage() {
     }
 
     async function handleAskStreaming() {
-        if (!canAsk || streaming) return
+        if (!canAsk || streaming) {
+            if (!canAsk) {
+                setStatusText('请先选择知识库后再提问')
+            }
+            return
+        }
         setStreaming(true)
         setAnswer('')
         setCitations([])
@@ -111,7 +130,11 @@ export default function LegalShellPage() {
 
         try {
             await chatCompletionStream(
-                { session_id: sessionId || undefined, query },
+                {
+                    session_id: sessionId || undefined,
+                    kb_id: sessionId ? undefined : currentKnowledgeBaseId || undefined,
+                    query,
+                },
                 {
                     onToken: (token) => {
                         setAnswer((prev) => prev + token)
@@ -157,12 +180,16 @@ export default function LegalShellPage() {
     }
 
     async function handleRunExperiment() {
+        if (!currentKnowledgeBaseId) {
+            setStatusText('请先选择当前知识库')
+            return
+        }
         if (!docId) {
             setStatusText('请先完成文档导入与建索引')
             return
         }
         try {
-            const res = await runExperiment([
+            const res = await runExperiment(currentKnowledgeBaseId, [
                 {
                     query: query || '公司拖欠工资怎么办？',
                     relevant_doc_ids: [docId],
@@ -176,101 +203,106 @@ export default function LegalShellPage() {
     }
 
     return (
-        <main className="min-h-screen bg-gray-50 p-6">
-            <div className="mx-auto max-w-5xl space-y-4">
-                <h1 className="text-2xl font-bold">法律 RAG 联调页</h1>
-                <p className="text-sm text-gray-600">
-                    目标：跑通导入 {'->'} 建索引 {'->'} 问答（阻塞/流式） {'->'} 引用高亮查看 {'->'} 实验评测。
-                </p>
-
-                <section className="rounded-lg border bg-white p-4 space-y-3">
-                    <h2 className="font-semibold">1. 文档导入与建索引</h2>
-                    <input
-                        type="file"
-                        accept=".pdf,.html,.htm,.txt"
-                        onChange={(e) => setFile(e.target.files?.[0] || null)}
-                    />
-                    <button
-                        className="px-3 py-2 rounded bg-blue-600 text-white disabled:opacity-40"
-                        onClick={handleImportAndIndex}
-                        disabled={!file || loading}
-                    >
-                        导入并建索引
-                    </button>
-                    <div className="text-sm text-gray-700">doc_id: {docId || '-'}</div>
-                </section>
-
-                <section className="rounded-lg border bg-white p-4 space-y-3">
-                    <h2 className="font-semibold">2. 问答（阻塞/流式）</h2>
-                    <textarea className="w-full border rounded p-2 h-28" value={query} onChange={(e) => setQuery(e.target.value)} />
-                    <div className="flex gap-2">
-                        <button
-                            className="px-3 py-2 rounded bg-emerald-600 text-white disabled:opacity-40"
-                            onClick={handleAskBlocking}
-                            disabled={!canAsk || loading || streaming}
-                        >
-                            阻塞式提问
-                        </button>
-                        <button
-                            className="px-3 py-2 rounded bg-violet-600 text-white disabled:opacity-40"
-                            onClick={handleAskStreaming}
-                            disabled={!canAsk || loading || streaming}
-                        >
-                            流式提问
-                        </button>
-                        <button className="px-3 py-2 rounded border" onClick={handleLoadHistory} disabled={!sessionId}>
-                            加载会话历史
-                        </button>
+        <AuthGuard>
+            <main className="min-h-screen bg-gray-50 p-6">
+                <div className="mx-auto max-w-5xl space-y-4">
+                    <h1 className="text-2xl font-bold">法律 RAG 联调页</h1>
+                    <p className="text-sm text-gray-600">
+                        目标：跑通导入 {'->'} 建索引 {'->'} 问答（阻塞/流式） {'->'} 引用高亮查看 {'->'} 实验评测。
+                    </p>
+                    <div className="text-sm text-gray-700">
+                        当前知识库: {currentKnowledgeBase?.name || '未选择'}
                     </div>
-                    <div className="text-sm text-gray-700">session_id: {sessionId || '-'}</div>
-                    <pre className="whitespace-pre-wrap text-sm bg-gray-50 p-3 rounded border">{answer || '暂无回答'}</pre>
-                </section>
 
-                <section className="rounded-lg border bg-white p-4 space-y-3">
-                    <h2 className="font-semibold">3. 引用查看（高亮）</h2>
-                    {citations.length === 0 && <div className="text-sm text-gray-500">暂无引用</div>}
-                    {citations.map((item) => (
-                        <div key={item.citation_id} className="border rounded p-3 bg-gray-50 space-y-2">
-                            <div className="text-sm font-medium">{item.source.title}</div>
-                            <div className="text-sm text-gray-700">{item.snippet}</div>
-                            <button className="px-2 py-1 rounded border" onClick={() => handleViewCitation(item.citation_id)}>
-                                查看原文上下文
+                    <section className="rounded-lg border bg-white p-4 space-y-3">
+                        <h2 className="font-semibold">1. 文档导入与建索引</h2>
+                        <input
+                            type="file"
+                            accept=".pdf,.html,.htm,.txt"
+                            onChange={(e) => setFile(e.target.files?.[0] || null)}
+                        />
+                        <button
+                            className="px-3 py-2 rounded bg-blue-600 text-white disabled:opacity-40"
+                            onClick={handleImportAndIndex}
+                            disabled={!file || loading || !currentKnowledgeBaseId}
+                        >
+                            导入并建索引
+                        </button>
+                        <div className="text-sm text-gray-700">doc_id: {docId || '-'}</div>
+                    </section>
+
+                    <section className="rounded-lg border bg-white p-4 space-y-3">
+                        <h2 className="font-semibold">2. 问答（阻塞/流式）</h2>
+                        <textarea className="w-full border rounded p-2 h-28" value={query} onChange={(e) => setQuery(e.target.value)} />
+                        <div className="flex gap-2">
+                            <button
+                                className="px-3 py-2 rounded bg-emerald-600 text-white disabled:opacity-40"
+                                onClick={handleAskBlocking}
+                                disabled={!canAsk || loading || streaming}
+                            >
+                                阻塞式提问
+                            </button>
+                            <button
+                                className="px-3 py-2 rounded bg-violet-600 text-white disabled:opacity-40"
+                                onClick={handleAskStreaming}
+                                disabled={!canAsk || loading || streaming}
+                            >
+                                流式提问
+                            </button>
+                            <button className="px-3 py-2 rounded border" onClick={handleLoadHistory} disabled={!sessionId}>
+                                加载会话历史
                             </button>
                         </div>
-                    ))}
-                    <div className="text-sm bg-gray-50 p-3 rounded border whitespace-pre-wrap">
-                        {!highlight && '尚未查看引用上下文'}
-                        {highlight && (
-                            <>
-                                {highlight.before}
-                                <mark className="bg-yellow-300">{highlight.hit || '(空命中片段)'}</mark>
-                                {highlight.after}
-                            </>
-                        )}
-                    </div>
-                </section>
+                        <div className="text-sm text-gray-700">session_id: {sessionId || '-'}</div>
+                        <pre className="whitespace-pre-wrap text-sm bg-gray-50 p-3 rounded border">{answer || '暂无回答'}</pre>
+                    </section>
 
-                <section className="rounded-lg border bg-white p-4 space-y-3">
-                    <h2 className="font-semibold">4. 实验评测（Recall@5 / MRR）</h2>
-                    <button className="px-3 py-2 rounded border" onClick={handleRunExperiment}>
-                        运行最小实验
-                    </button>
-                    <pre className="whitespace-pre-wrap text-sm bg-gray-50 p-3 rounded border">{expResult || '暂无实验结果'}</pre>
-                </section>
-
-                <section className="rounded-lg border bg-white p-4 space-y-3">
-                    <h2 className="font-semibold">5. 会话历史</h2>
-                    {history.length === 0 && <div className="text-sm text-gray-500">暂无历史消息</div>}
-                    {history.map((msg) => (
-                        <div key={msg.msg_id} className="rounded border p-2">
-                            <div className="text-xs text-gray-500">{msg.role} | {msg.created_at}</div>
-                            <div className="text-sm whitespace-pre-wrap">{msg.content}</div>
+                    <section className="rounded-lg border bg-white p-4 space-y-3">
+                        <h2 className="font-semibold">3. 引用查看（高亮）</h2>
+                        {citations.length === 0 && <div className="text-sm text-gray-500">暂无引用</div>}
+                        {citations.map((item) => (
+                            <div key={item.citation_id} className="border rounded p-3 bg-gray-50 space-y-2">
+                                <div className="text-sm font-medium">{item.source.title}</div>
+                                <div className="text-sm text-gray-700">{item.snippet}</div>
+                                <button className="px-2 py-1 rounded border" onClick={() => handleViewCitation(item.citation_id)}>
+                                    查看原文上下文
+                                </button>
+                            </div>
+                        ))}
+                        <div className="text-sm bg-gray-50 p-3 rounded border whitespace-pre-wrap">
+                            {!highlight && '尚未查看引用上下文'}
+                            {highlight && (
+                                <>
+                                    {highlight.before}
+                                    <mark className="bg-yellow-300">{highlight.hit || '(空命中片段)'}</mark>
+                                    {highlight.after}
+                                </>
+                            )}
                         </div>
-                    ))}
-                </section>
+                    </section>
 
-                <div className="text-sm text-gray-700">状态: {statusText}</div>
-            </div>
-        </main>
+                    <section className="rounded-lg border bg-white p-4 space-y-3">
+                        <h2 className="font-semibold">4. 实验评测（Recall@5 / MRR）</h2>
+                        <button className="px-3 py-2 rounded border" onClick={handleRunExperiment} disabled={!currentKnowledgeBaseId}>
+                            运行最小实验
+                        </button>
+                        <pre className="whitespace-pre-wrap text-sm bg-gray-50 p-3 rounded border">{expResult || '暂无实验结果'}</pre>
+                    </section>
+
+                    <section className="rounded-lg border bg-white p-4 space-y-3">
+                        <h2 className="font-semibold">5. 会话历史</h2>
+                        {history.length === 0 && <div className="text-sm text-gray-500">暂无历史消息</div>}
+                        {history.map((msg) => (
+                            <div key={msg.msg_id} className="rounded border p-2">
+                                <div className="text-xs text-gray-500">{msg.role} | {msg.created_at}</div>
+                                <div className="text-sm whitespace-pre-wrap">{msg.content}</div>
+                            </div>
+                        ))}
+                    </section>
+
+                    <div className="text-sm text-gray-700">状态: {statusText}</div>
+                </div>
+            </main>
+        </AuthGuard>
     )
 }

@@ -1,34 +1,23 @@
-﻿'use client'
+'use client'
 
-import Link from 'next/link'
+import { Spin } from 'antd'
+import { useRouter } from 'next/navigation'
 import { useEffect } from 'react'
+import { useAppSession } from '@/lib/session/AppSessionProvider'
 
-export default function Home() {
+
+export default function HomePage() {
+    const router = useRouter()
+    const { loading, user } = useAppSession()
+
     useEffect(() => {
-        const timer = window.setTimeout(() => {
-            window.location.replace('/chat/')
-        }, 180)
-
-        return () => window.clearTimeout(timer)
-    }, [])
+        if (loading) return
+        router.replace(user ? '/chat' : '/login')
+    }, [loading, router, user])
 
     return (
-        <main className="home-redirect">
-            <div className="home-redirect-card">
-                <div className="home-redirect-kicker">Redirecting To Workspace</div>
-                <h1 className="home-redirect-title">正在进入法律辅助咨询工作台</h1>
-                <p className="home-redirect-copy">
-                    系统会自动跳转到对话页。如果浏览器没有及时跳转，可以直接打开工作台入口。
-                </p>
-                <div style={{ display: 'flex', gap: 16, marginTop: 18, flexWrap: 'wrap' }}>
-                    <Link href="/chat/" className="home-redirect-link">
-                        进入对话页
-                    </Link>
-                    <Link href="/knowledge/" className="home-redirect-link" style={{ color: 'var(--accent-navy)' }}>
-                        知识库管理
-                    </Link>
-                </div>
-            </div>
+        <main style={{ minHeight: '100vh', display: 'grid', placeItems: 'center' }}>
+            <Spin size="large" />
         </main>
     )
 }

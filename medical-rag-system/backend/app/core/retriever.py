@@ -192,7 +192,9 @@ def rerank(
     rerank_provider = (settings.RERANK_PROVIDER or "").strip().lower()
     cross_scores: List[float] = []
 
-    if rerank_provider == "siliconflow" and settings.SILICONFLOW_API_KEY:
+    if rerank_provider in {"heuristic", "none", "disabled", "simple"}:
+        cross_scores = []
+    elif rerank_provider == "siliconflow" and settings.SILICONFLOW_API_KEY:
         cross_scores = siliconflow_rerank(
             query=query,
             candidates=candidates,

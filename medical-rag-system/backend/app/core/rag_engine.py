@@ -29,7 +29,7 @@ from rank_bm25 import BM25Okapi
 
 from app.core.config import settings
 from app.repositories import PgRepository
-from app.services import SessionService
+from app.services import AuthService, SessionService
 
 from .text_utils import ChunkRecord, PRONOUN_REF_PATTERN, now_iso, tokenize
 from .embedder import EmbeddingService
@@ -53,12 +53,16 @@ class LegalRagService:
 
         # 数据库：使用 PostgreSQL
         self.repo = PgRepository(settings.DATABASE_URL)
+        self.auth_service = AuthService(self.repo)
         self.session_service = SessionService(self.repo)
 
         self._lock = threading.RLock()
         self.chunk_lookup: Dict[str, ChunkRecord] = {}
         self.chunk_terms: Dict[str, List[str]] = {}
         self.doc_chunk_ids: Dict[str, List[str]] = {}
+        self.chunk_kb_ids: Dict[str, str] = {}
+        self.kb_chunk_ids: Dict[str, List[str]] = {}
+        self.vector_chunk_index: Dict[str, int] = {}
 
         self.bm25_enabled = True
         self.vector_enabled = True
@@ -76,7 +80,13 @@ class LegalRagService:
         self.cross_encoder_model_name = settings.RERANK_MODEL_NAME
         self._cross_encoder_state: dict = {"model": None, "disabled": False}
 
+        self._bootstrap_security_model()
         self._reload_index_cache()
+
+    def _bootstrap_security_model(self) -> None:
+        admin_user = self.auth_service.ensure_bootstrap_admin()
+        system_kb = self.auth_service.create_system_knowledge_base(admin_user["user_id"])
+        self.auth_service.migrate_legacy_data(system_kb_id=system_kb["kb_id"], admin_user_id=admin_user["user_id"])
 
     def _data_root(self) -> Path:
         return Path(settings.DATA_DIR)
@@ -114,6 +124,42 @@ class LegalRagService:
         end = max(start, min(int(end_pos), text_length))
         return {"start": start, "end": end}
 
+    def _get_kb_chunk_ids(self, kb_id: str) -> List[str]:
+        return list(self.kb_chunk_ids.get(kb_id, []))
+
+    def _build_kb_bm25_index(self, kb_id: str) -> tuple[Optional[BM25Okapi], List[str]]:
+        chunk_ids = self._get_kb_chunk_ids(kb_id)
+        if not chunk_ids:
+            return None, []
+        corpus_tokens = [self.chunk_terms.get(chunk_id, []) for chunk_id in chunk_ids]
+        return BM25Okapi(corpus_tokens), chunk_ids
+
+    def _build_kb_vector_state(self, kb_id: str) -> tuple[List[str], np.ndarray]:
+        chunk_ids = self._get_kb_chunk_ids(kb_id)
+        if not chunk_ids or self.vector_matrix.size == 0:
+            return [], np.zeros((0, 1), dtype=np.float32)
+        indexes = [self.vector_chunk_index[chunk_id] for chunk_id in chunk_ids if chunk_id in self.vector_chunk_index]
+        if not indexes:
+            return [], np.zeros((0, 1), dtype=np.float32)
+        matrix = self.vector_matrix[indexes]
+        filtered_chunk_ids = [self.vector_chunk_ids[idx] for idx in indexes]
+        return filtered_chunk_ids, matrix
+
+    def _ensure_knowledge_base_exists(self, kb_id: str) -> Dict[str, Any]:
+        kb = self.repo.get_knowledge_base(kb_id)
+        if kb is None:
+            raise KeyError("知识库不存在")
+        return kb
+
+    def _ensure_citation_access(self, citation_id: str, user_id: str) -> Dict[str, Any]:
+        citation = self.repo.get_citation_access_context(citation_id)
+        if citation is None:
+            raise KeyError("引用不存在")
+        owner = citation.get("session_user_id")
+        if owner and owner != user_id:
+            raise KeyError("引用不存在")
+        return citation
+
     # ─── ChromaDB 初始化 ──────────────────────────────────
     def _init_chroma(self) -> None:
         backend = (settings.VECTOR_DB_BACKEND or "").strip().lower()
@@ -148,6 +194,8 @@ class LegalRagService:
             self.chunk_lookup.clear()
             self.chunk_terms.clear()
             self.doc_chunk_ids.clear()
+            self.chunk_kb_ids.clear()
+            self.kb_chunk_ids.clear()
             for row in self.repo.list_chunks(indexed_only=True):
                 chunk = ChunkRecord(
                     chunk_id=row["chunk_id"],
@@ -165,6 +213,10 @@ class LegalRagService:
                 self.chunk_lookup[chunk.chunk_id] = chunk
                 self.chunk_terms[chunk.chunk_id] = tokenize(chunk.chunk_text)
                 self.doc_chunk_ids.setdefault(chunk.doc_id, []).append(chunk.chunk_id)
+                kb_id = str(row.get("kb_id") or "")
+                self.chunk_kb_ids[chunk.chunk_id] = kb_id
+                if kb_id:
+                    self.kb_chunk_ids.setdefault(kb_id, []).append(chunk.chunk_id)
             self._rebuild_bm25_index()
             self._rebuild_vector_index()
 
@@ -197,12 +249,14 @@ class LegalRagService:
         if not self.vector_enabled:
             self.vector_chunk_ids = []
             self.vector_matrix = np.zeros((0, 1), dtype=np.float32)
+            self.vector_chunk_index = {}
             self._clear_chroma()
             return
         chunk_ids = list(self.chunk_lookup.keys())
         if not chunk_ids:
             self.vector_chunk_ids = []
             self.vector_matrix = np.zeros((0, 1), dtype=np.float32)
+            self.vector_chunk_index = {}
             self._clear_chroma()
             return
         from .text_utils import l2_normalize_rows
@@ -213,12 +267,14 @@ class LegalRagService:
             logger.warning("rebuild vector index failed, fallback to empty vector index: %s", exc)
             self.vector_chunk_ids = []
             self.vector_matrix = np.zeros((0, 1), dtype=np.float32)
+            self.vector_chunk_index = {}
             self._clear_chroma()
             return
         embeddings = np.asarray(embeddings, dtype=np.float32)
         embeddings = l2_normalize_rows(embeddings)
         self.vector_chunk_ids = chunk_ids
         self.vector_matrix = embeddings
+        self.vector_chunk_index = {chunk_id: idx for idx, chunk_id in enumerate(chunk_ids)}
         if self.chroma_collection is None:
             return
         try:
@@ -242,17 +298,18 @@ class LegalRagService:
             logger.warning("Chroma upsert 失败: %s", exc)
 
     # ─── 文档管理 (委托) ─────────────────────────────────
-    def import_document(self, file_name: str, content: bytes, doc_type=None, source_url=None, overwrite_doc_id=None):
-        result = import_document(
+    def import_document(self, kb_id: str, uploaded_by: str, file_name: str, content: bytes, doc_type=None, source_url=None, overwrite_doc_id=None):
+        self._ensure_knowledge_base_exists(kb_id)
+        return import_document(
             self.repo,
+            kb_id,
+            uploaded_by,
             file_name,
             content,
             doc_type,
             source_url,
             overwrite_doc_id=overwrite_doc_id,
         )
-        self._reload_index_cache()
-        return result
 
     def build_index(self, doc_id, chunk_size=None, overlap=None, bm25_enabled=True, vector_enabled=True, embed_model=None):
         doc = self.repo.get_document(doc_id)
@@ -271,12 +328,11 @@ class LegalRagService:
             doc_type=doc["doc_type"],
             document_meta=document_meta,
         )
-        self.repo.replace_chunks(doc_id, chunk_rows)
         semantic_chunking_enabled = any((row.get("locator_json") or {}).get("unit_kind") == "article" for row in chunk_rows)
-        self.repo.update_document_index_status(
+        self.repo.replace_chunks_and_update_document(
             doc_id,
             parse_status="indexed",
-            chunks=len(chunk_rows),
+            chunks=chunk_rows,
             meta_updates={
                 "source_fingerprint": document_meta["source_fingerprint"],
                 "chunk_strategy_version": CHUNK_STRATEGY_VERSION,
@@ -295,17 +351,94 @@ class LegalRagService:
             "vector": {"enabled": self.vector_enabled, "embed_model": self.embedding_service.name},
         }
 
+    def enqueue_index_job(self, *, doc_id: str, requested_by: str, options: Dict[str, Any]) -> Dict[str, Any]:
+        doc = self.repo.get_document(doc_id, include_text=False)
+        if doc is None:
+            raise KeyError("文档不存在")
+
+        job = self.repo.enqueue_index_job(
+            job_id=f"idxjob_{uuid.uuid4().hex[:16]}",
+            doc_id=doc_id,
+            kb_id=doc["kb_id"],
+            requested_by=requested_by,
+            payload=options,
+            max_attempts=settings.INDEX_JOB_MAX_ATTEMPTS,
+            created_at=now_iso(),
+        )
+        self.repo.update_document_index_status(doc_id, parse_status="indexing")
+        return {
+            "job_id": job["job_id"],
+            "doc_id": doc_id,
+            "kb_id": doc["kb_id"],
+            "status": "indexing",
+            "parse_status": "indexing",
+        }
+
+    def process_next_index_job(self) -> Optional[Dict[str, Any]]:
+        job = self.repo.claim_next_index_job(now_value=now_iso())
+        if job is None:
+            return None
+
+        payload = job.get("payload") or {}
+        try:
+            result = self.build_index(
+                job["doc_id"],
+                chunk_size=(payload.get("chunk") or {}).get("size"),
+                overlap=(payload.get("chunk") or {}).get("overlap"),
+                bm25_enabled=(payload.get("bm25") or {}).get("enabled", True),
+                vector_enabled=(payload.get("vector") or {}).get("enabled", True),
+                embed_model=(payload.get("vector") or {}).get("embed_model"),
+            )
+            self.repo.complete_index_job(job["job_id"], finished_at=now_iso())
+            return {
+                "job_id": job["job_id"],
+                "doc_id": job["doc_id"],
+                "kb_id": job["kb_id"],
+                "status": "indexed",
+                "result": result,
+            }
+        except Exception as exc:
+            error_message = str(exc)
+            self.repo.fail_index_job(job["job_id"], error_message=error_message, finished_at=now_iso())
+            self.repo.update_document_index_status(job["doc_id"], parse_status="failed")
+            logger.exception("index job failed: %s", job["job_id"])
+            return {
+                "job_id": job["job_id"],
+                "doc_id": job["doc_id"],
+                "kb_id": job["kb_id"],
+                "status": "failed",
+                "error": error_message,
+            }
+
     def get_doc_status(self, doc_id):
         doc = self.repo.get_document(doc_id, include_text=False)
         if doc is None:
             raise KeyError("文档不存在")
-        return {"doc_id": doc["doc_id"], "title": doc["title"], "doc_type": doc["doc_type"],
-                "parse_status": doc["parse_status"], "chunks": doc.get("chunks", 0), "created_at": doc["created_at"]}
+        latest_job = self.repo.get_latest_index_job_for_doc(doc_id)
+        result = {
+            "doc_id": doc["doc_id"],
+            "title": doc["title"],
+            "doc_type": doc["doc_type"],
+            "parse_status": doc["parse_status"],
+            "chunks": doc.get("chunks", 0),
+            "created_at": doc["created_at"],
+            "kb_id": doc.get("kb_id"),
+        }
+        if latest_job:
+            result["latest_job"] = {
+                "job_id": latest_job["job_id"],
+                "status": latest_job["status"],
+                "attempts": latest_job.get("attempts", 0),
+                "error_message": latest_job.get("error_message"),
+                "updated_at": latest_job.get("updated_at"),
+            }
+        return result
 
-    def list_docs(self):
-        docs = self.repo.list_documents(include_text=False)
+    def list_docs(self, kb_id: str):
+        self._ensure_knowledge_base_exists(kb_id)
+        docs = self.repo.list_documents(include_text=False, kb_id=kb_id)
         return [{"doc_id": d["doc_id"], "title": d["title"], "doc_type": d["doc_type"],
-                 "parse_status": d["parse_status"], "chunks": d.get("chunks", 0), "created_at": d["created_at"]} for d in docs]
+                 "parse_status": d["parse_status"], "chunks": d.get("chunks", 0), "created_at": d["created_at"], "kb_id": d.get("kb_id")} for d in docs]
 
     def delete_document(self, doc_id: str) -> bool:
         """删除文档及其关联数据，并重建索引缓存。"""
@@ -326,21 +459,132 @@ class LegalRagService:
             self._reload_index_cache()
         return deleted
 
+    def list_knowledge_bases(self, *, user_id: str, user_role: str) -> List[Dict[str, Any]]:
+        return [
+            {
+                "kb_id": kb["kb_id"],
+                "name": kb["name"],
+                "description": kb.get("description"),
+                "status": kb.get("status", "active"),
+                "owner_user_id": kb.get("owner_user_id"),
+                "visibility": kb.get("visibility", "system"),
+                "access_level": kb.get("access_level"),
+                "is_default": bool(kb.get("is_default")),
+                "created_by": kb.get("created_by"),
+                "created_at": kb.get("created_at"),
+                "updated_at": kb.get("updated_at"),
+                "document_count": int(kb.get("document_count") or 0),
+            }
+            for kb in self.repo.list_accessible_knowledge_bases(user_id=user_id, role=user_role)
+        ]
+
+    def create_knowledge_base(self, *, user_id: str, name: str, description: Optional[str]) -> Dict[str, Any]:
+        normalized_name = (name or "").strip()
+        if not normalized_name:
+            raise ValueError("知识库名称不能为空")
+        if self.repo.get_knowledge_base_by_name(normalized_name, owner_user_id=user_id, visibility="private"):
+            raise ValueError("知识库名称已存在")
+        now = now_iso()
+        return self.repo.create_knowledge_base(
+            kb_id=f"kb_{uuid.uuid4().hex[:12]}",
+            name=normalized_name,
+            description=(description or "").strip() or None,
+            status="active",
+            created_by=user_id,
+            owner_user_id=user_id,
+            visibility="private",
+            is_default=False,
+            created_at=now,
+            updated_at=now,
+        )
+
+    def update_knowledge_base(
+        self,
+        *,
+        user_id: str,
+        user_role: str,
+        kb_id: str,
+        name: Optional[str],
+        description: Optional[str],
+        status: Optional[str],
+    ) -> Dict[str, Any]:
+        if status and status not in {"active", "disabled"}:
+            raise ValueError("知识库状态仅支持 active / disabled")
+        existing = self.repo.get_knowledge_base(kb_id)
+        if existing is None:
+            raise KeyError("知识库不存在")
+        if existing.get("visibility") == "private" and existing.get("owner_user_id") != user_id:
+            raise KeyError("知识库不存在")
+        if existing.get("visibility") == "system" and user_role != "admin":
+            raise PermissionError("当前知识库无写入权限")
+        normalized_name = name.strip() if name else None
+        if normalized_name and normalized_name != existing.get("name"):
+            duplicated = self.repo.get_knowledge_base_by_name(
+                normalized_name,
+                owner_user_id=existing.get("owner_user_id"),
+                visibility=existing.get("visibility"),
+            )
+            if duplicated and duplicated.get("kb_id") != kb_id:
+                raise ValueError("知识库名称已存在")
+        updated = self.repo.update_knowledge_base(
+            kb_id,
+            name=normalized_name if normalized_name else None,
+            description=(description or "").strip() if description is not None else None,
+            status=status,
+            updated_at=now_iso(),
+        )
+        if updated is None:
+            raise KeyError("知识库不存在")
+        return updated
+
+    def delete_knowledge_base(self, *, user_id: str, kb_id: str) -> Dict[str, Any]:
+        existing = self.repo.get_knowledge_base(kb_id)
+        if existing is None:
+            raise KeyError("知识库不存在")
+        if existing.get("visibility") != "private":
+            raise PermissionError("系统知识库不允许删除")
+        if existing.get("owner_user_id") != user_id:
+            raise KeyError("知识库不存在")
+        if self.repo.count_knowledge_base_documents(kb_id) > 0:
+            raise ValueError("仅允许删除空私有知识库")
+        if self.repo.count_private_knowledge_bases(user_id) <= 1:
+            raise ValueError("至少保留一个私有知识库")
+
+        deleted = self.repo.delete_knowledge_base(kb_id)
+        if not deleted:
+            raise KeyError("知识库不存在")
+
+        if existing.get("is_default"):
+            remaining = self.repo.list_private_knowledge_bases(user_id)
+            if remaining:
+                self.repo.update_knowledge_base(remaining[0]["kb_id"], is_default=True, updated_at=now_iso())
+
+        return {"kb_id": kb_id, "deleted": True}
+
     # ─── 检索 + 生成 ────────────────────────────────────
-    def retrieve(self, query, bm25_topn=50, vector_topn=50, fusion_k=60,
+    def retrieve(self, query, kb_id, bm25_topn=50, vector_topn=50, fusion_k=60,
                  rerank_topk=30, rerank_topm=8, save_citations=True,
                  llm=None, history_messages=None, summary_text="",
                  user_query_for_answer=None, generate_answer_flag=True,
                  assistant_message_id=None):
-        chunks = self._indexed_chunks()
+        chunk_ids = self._get_kb_chunk_ids(kb_id)
         query_tokens = tokenize(query)
         if not query_tokens:
             raise ValueError("查询内容为空或不可解析。")
 
-        if chunks:
-            bm25_ranked = rank_bm25(query_tokens, bm25_topn, self.bm25_enabled, self.bm25_index, self.bm25_chunk_ids)
-            vector_ranked = rank_dense(query, vector_topn, self.vector_enabled, self.embedding_service,
-                                       self.vector_chunk_ids, self.vector_matrix, self.chroma_collection)
+        if chunk_ids:
+            kb_bm25_index, kb_bm25_chunk_ids = self._build_kb_bm25_index(kb_id)
+            kb_vector_chunk_ids, kb_vector_matrix = self._build_kb_vector_state(kb_id)
+            bm25_ranked = rank_bm25(query_tokens, bm25_topn, self.bm25_enabled, kb_bm25_index, kb_bm25_chunk_ids)
+            vector_ranked = rank_dense(
+                query,
+                vector_topn,
+                self.vector_enabled,
+                self.embedding_service,
+                kb_vector_chunk_ids,
+                kb_vector_matrix,
+                None,
+            )
             fused = rrf_fusion(bm25_ranked, vector_ranked, fusion_k)[:max(1, rerank_topk)]
             reranked = rerank(query, query_tokens, fused, bm25_ranked, vector_ranked,
                               self.chunk_lookup, self.chunk_terms, self._cross_encoder_state, self.cross_encoder_model_name)
@@ -369,19 +613,28 @@ class LegalRagService:
         return {"answer_md": answer, "citations": citations,
                 "debug": {"bm25": bm25_ranked, "vector": vector_ranked, "fusion": fused, "rerank": reranked}}
 
-    async def retrieve_stream(self, query, bm25_topn=50, vector_topn=50, fusion_k=60,
+    async def retrieve_stream(self, query, kb_id, bm25_topn=50, vector_topn=50, fusion_k=60,
                  rerank_topk=30, rerank_topm=8, save_citations=True,
                  llm=None, history_messages=None, summary_text="",
                  user_query_for_answer=None, assistant_message_id=None):
-        chunks = self._indexed_chunks()
+        chunk_ids = self._get_kb_chunk_ids(kb_id)
         query_tokens = tokenize(query)
         if not query_tokens:
             raise ValueError("查询内容为空或不可解析。")
 
-        if chunks:
-            bm25_ranked = rank_bm25(query_tokens, bm25_topn, self.bm25_enabled, self.bm25_index, self.bm25_chunk_ids)
-            vector_ranked = rank_dense(query, vector_topn, self.vector_enabled, self.embedding_service,
-                                       self.vector_chunk_ids, self.vector_matrix, self.chroma_collection)
+        if chunk_ids:
+            kb_bm25_index, kb_bm25_chunk_ids = self._build_kb_bm25_index(kb_id)
+            kb_vector_chunk_ids, kb_vector_matrix = self._build_kb_vector_state(kb_id)
+            bm25_ranked = rank_bm25(query_tokens, bm25_topn, self.bm25_enabled, kb_bm25_index, kb_bm25_chunk_ids)
+            vector_ranked = rank_dense(
+                query,
+                vector_topn,
+                self.vector_enabled,
+                self.embedding_service,
+                kb_vector_chunk_ids,
+                kb_vector_matrix,
+                None,
+            )
             fused = rrf_fusion(bm25_ranked, vector_ranked, fusion_k)[:max(1, rerank_topk)]
             reranked = rerank(query, query_tokens, fused, bm25_ranked, vector_ranked,
                               self.chunk_lookup, self.chunk_terms, self._cross_encoder_state, self.cross_encoder_model_name)
@@ -414,11 +667,18 @@ class LegalRagService:
             yield {"type": "chunk", "content": chunk}
 
 
-    def chat(self, session_id, query, topn, fusion, rerank, llm, request_id=None):
-        turn = self.session_service.start_turn(session_id=session_id, query=query, request_id=request_id)
+    def chat(self, user_id, session_id, kb_id, query, topn, fusion, rerank, llm, request_id=None):
+        turn = self.session_service.start_turn(
+            user_id=user_id,
+            kb_id=kb_id,
+            session_id=session_id,
+            query=query,
+            request_id=request_id,
+        )
         try:
             result = self.retrieve(
                 query=turn.retrieval_query,
+                kb_id=turn.session["kb_id"],
                 bm25_topn=topn.get("bm25", settings.TOPN_BM25),
                 vector_topn=topn.get("vector", settings.TOPN_VECTOR),
                 fusion_k=fusion.get("k", settings.FUSION_K),
@@ -457,8 +717,14 @@ class LegalRagService:
             )
             raise
 
-    async def chat_stream(self, session_id, query, topn, fusion, rerank, llm, request_id=None):
-        turn = self.session_service.start_turn(session_id=session_id, query=query, request_id=request_id)
+    async def chat_stream(self, user_id, session_id, kb_id, query, topn, fusion, rerank, llm, request_id=None):
+        turn = self.session_service.start_turn(
+            user_id=user_id,
+            kb_id=kb_id,
+            session_id=session_id,
+            query=query,
+            request_id=request_id,
+        )
         full_answer: List[str] = []
         citations = []
         debug_info: Dict[str, Any] = {}
@@ -466,6 +732,7 @@ class LegalRagService:
         try:
             async for item in self.retrieve_stream(
                 query=turn.retrieval_query,
+                kb_id=turn.session["kb_id"],
                 bm25_topn=topn.get("bm25", settings.TOPN_BM25),
                 vector_topn=topn.get("vector", settings.TOPN_VECTOR),
                 fusion_k=fusion.get("k", settings.FUSION_K),
@@ -519,28 +786,27 @@ class LegalRagService:
             )
             raise
 
-    def get_session_history(self, session_id, limit=50):
-        return {"session_id": session_id, "messages": self.session_service.list_messages(session_id=session_id, limit=limit)}
+    def get_session_history(self, user_id, session_id, limit=50):
+        return {"session_id": session_id, "messages": self.session_service.list_messages(user_id=user_id, session_id=session_id, limit=limit)}
 
-    def create_session(self, title=None):
-        return self.session_service.create_session(title=title)
+    def create_session(self, user_id, kb_id, title=None):
+        self._ensure_knowledge_base_exists(kb_id)
+        return self.session_service.create_session(user_id=user_id, kb_id=kb_id, title=title)
 
-    def list_sessions(self, limit=20, status="active"):
-        return {"items": self.session_service.list_sessions(limit=limit, status=status)}
+    def list_sessions(self, user_id, kb_id, limit=20, status="active"):
+        return {"items": self.session_service.list_sessions(user_id=user_id, kb_id=kb_id, limit=limit, status=status)}
 
-    def get_session_detail(self, session_id, message_limit=50):
-        return self.session_service.get_session_detail(session_id=session_id, message_limit=message_limit)
+    def get_session_detail(self, user_id, session_id, message_limit=50):
+        return self.session_service.get_session_detail(user_id=user_id, session_id=session_id, message_limit=message_limit)
 
-    def update_session(self, session_id, title=None, status=None):
-        return self.session_service.update_session(session_id=session_id, title=title, status=status)
+    def update_session(self, user_id, session_id, title=None, status=None):
+        return self.session_service.update_session(user_id=user_id, session_id=session_id, title=title, status=status)
 
-    def delete_session(self, session_id):
-        return self.session_service.delete_session(session_id=session_id)
+    def delete_session(self, user_id, session_id):
+        return self.session_service.delete_session(user_id=user_id, session_id=session_id)
 
-    def get_citation_view(self, citation_id, context_before, context_after):
-        citation = self.repo.get_citation(citation_id)
-        if citation is None:
-            raise KeyError("引用不存在")
+    def get_citation_view(self, user_id, citation_id, context_before, context_after):
+        citation = self._ensure_citation_access(citation_id, user_id)
         payload = citation["payload"]
         chunk = self.chunk_lookup.get(citation["chunk_id"])
         doc = self.repo.get_document(citation["doc_id"])
@@ -577,10 +843,8 @@ class LegalRagService:
             "file_name": doc.get("original_file_name") or file_path.name,
         }
 
-    def get_citation_open_target(self, citation_id: str) -> Dict[str, Any]:
-        citation = self.repo.get_citation(citation_id)
-        if citation is None:
-            raise KeyError("引用不存在")
+    def get_citation_open_target(self, user_id: str, citation_id: str) -> Dict[str, Any]:
+        citation = self._ensure_citation_access(citation_id, user_id)
 
         doc = self.repo.get_document(citation["doc_id"], include_text=False)
         chunk = self.chunk_lookup.get(citation["chunk_id"])
@@ -631,13 +895,13 @@ class LegalRagService:
             "viewer_ready": True,
         }
 
-    def get_document_viewer_content(self, doc_id: str, citation_id: str) -> Dict[str, Any]:
+    def get_document_viewer_content(self, user_id: str, doc_id: str, citation_id: str) -> Dict[str, Any]:
         doc = self.repo.get_document(doc_id)
         if doc is None:
             raise KeyError("文档不存在")
 
-        citation = self.repo.get_citation(citation_id)
-        if citation is None or citation["doc_id"] != doc_id:
+        citation = self._ensure_citation_access(citation_id, user_id)
+        if citation["doc_id"] != doc_id:
             raise KeyError("引用不存在")
 
         chunk = self.chunk_lookup.get(citation["chunk_id"])
@@ -672,6 +936,7 @@ class LegalRagService:
         chunk_items = self.repo.list_chunks(doc_id=doc_id)
         return {
             "doc_id": doc["doc_id"],
+            "kb_id": doc.get("kb_id"),
             "title": doc["title"],
             "doc_type": doc["doc_type"],
             "parse_status": doc["parse_status"],
@@ -699,9 +964,10 @@ class LegalRagService:
         }
 
     # ─── 实验评测 ────────────────────────────────────────
-    def run_experiment(self, dataset, topn, fusion, rerank, dataset_version: Optional[str] = None):
+    def run_experiment(self, kb_id, dataset, topn, fusion, rerank, dataset_version: Optional[str] = None):
         if not dataset:
             raise ValueError("实验数据集不能为空。")
+        self._ensure_knowledge_base_exists(kb_id)
 
         rerank_options = rerank or {}
         metrics_totals = {
@@ -720,6 +986,7 @@ class LegalRagService:
                 raise ValueError("每个实验样本至少需要 relevant_chunk_ids 或 relevant_doc_ids。")
 
             group_rankings = self._build_experiment_group_rankings(
+                kb_id=kb_id,
                 query=query,
                 topn=topn,
                 fusion=fusion,
@@ -772,15 +1039,18 @@ class LegalRagService:
         resolved_dataset_version = dataset_version or self._compute_dataset_version(dataset)
         created_at = now_iso()
         config = {
+            "kb_id": kb_id,
             "dataset_version": resolved_dataset_version,
-            "corpus_version": self._get_corpus_version(),
+            "corpus_version": self._get_corpus_version(kb_id),
             "chunk_strategy_version": CHUNK_STRATEGY_VERSION,
             "vector_backend": settings.VECTOR_DB_BACKEND,
-            "embedding_provider": settings.EMBEDDING_PROVIDER,
+            "embedding_provider": self.embedding_service.name,
             "embedding_model": self.embedding_service.name,
             "rerank_provider": settings.RERANK_PROVIDER,
             "rerank_model": settings.SILICONFLOW_RERANK_MODEL
             if (settings.RERANK_PROVIDER or "").strip().lower() == "siliconflow"
+            else "heuristic"
+            if (settings.RERANK_PROVIDER or "").strip().lower() in {"heuristic", "none", "disabled", "simple"}
             else self.cross_encoder_model_name,
             "topn": topn,
             "fusion": fusion,
@@ -795,7 +1065,7 @@ class LegalRagService:
         }
         run_id = f"run_{uuid.uuid4().hex[:12]}"
         mode = "four_group_retrieval_benchmark"
-        self.repo.save_run(run_id, mode, config, metrics, created_at)
+        self.repo.save_run(run_id, kb_id, mode, config, metrics, created_at)
         return {
             "run_id": run_id,
             "mode": mode,
@@ -804,38 +1074,40 @@ class LegalRagService:
             "created_at": created_at,
         }
 
-    def get_run(self, run_id):
-        run = self.repo.get_run(run_id)
+    def get_run(self, kb_id, run_id):
+        run = self.repo.get_run(run_id, kb_id=kb_id)
         if run is None:
             raise KeyError("实验运行记录不存在")
         return {"run_id": run["run_id"], "mode": run["mode"], "config": run["config"],
                 "metrics": run["metrics"], "created_at": run["created_at"]}
 
-    def list_runs(self, limit=20):
-        items = self.repo.list_runs(limit=limit)
+    def list_runs(self, kb_id, limit=20):
+        items = self.repo.list_runs(limit=limit, kb_id=kb_id)
         return {"items": [{"run_id": i["run_id"], "mode": i["mode"], "config": i["config"],
                            "metrics": i["metrics"], "created_at": i["created_at"]} for i in items]}
 
-    def _build_experiment_group_rankings(self, query, topn, fusion, rerank_options):
+    def _build_experiment_group_rankings(self, kb_id, query, topn, fusion, rerank_options):
         query_tokens = tokenize(query)
         if not query_tokens:
             raise ValueError("查询内容为空或不可解析。")
 
+        kb_bm25_index, kb_bm25_chunk_ids = self._build_kb_bm25_index(kb_id)
+        kb_vector_chunk_ids, kb_vector_matrix = self._build_kb_vector_state(kb_id)
         bm25_ranked = rank_bm25(
             query_tokens,
             topn.get("bm25", settings.TOPN_BM25),
             self.bm25_enabled,
-            self.bm25_index,
-            self.bm25_chunk_ids,
+            kb_bm25_index,
+            kb_bm25_chunk_ids,
         )
         vector_ranked = rank_dense(
             query,
             topn.get("vector", settings.TOPN_VECTOR),
             self.vector_enabled,
             self.embedding_service,
-            self.vector_chunk_ids,
-            self.vector_matrix,
-            self.chroma_collection,
+            kb_vector_chunk_ids,
+            kb_vector_matrix,
+            None,
         )
         fused = rrf_fusion(bm25_ranked, vector_ranked, fusion.get("k", settings.FUSION_K))[
             : max(5, rerank_options.get("topk", settings.RERANK_TOPK))
@@ -934,8 +1206,8 @@ class LegalRagService:
         raw = json.dumps(normalized_cases, ensure_ascii=False, sort_keys=True)
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
-    def _get_corpus_version(self) -> str:
-        docs = self.repo.list_documents(include_text=False)
+    def _get_corpus_version(self, kb_id: str) -> str:
+        docs = self.repo.list_documents(include_text=False, kb_id=kb_id)
         parts = []
         for doc in docs:
             if doc.get("parse_status") != "indexed":
@@ -946,8 +1218,10 @@ class LegalRagService:
         raw = "|".join(sorted(parts)) or "empty_corpus"
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
-    def _indexed_chunks(self):
+    def _indexed_chunks(self, kb_id: Optional[str] = None):
         with self._lock:
+            if kb_id:
+                return [self.chunk_lookup[chunk_id] for chunk_id in self._get_kb_chunk_ids(kb_id) if chunk_id in self.chunk_lookup]
             return list(self.chunk_lookup.values())
 
 

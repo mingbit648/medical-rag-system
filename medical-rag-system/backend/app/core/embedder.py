@@ -144,6 +144,10 @@ class EmbeddingService:
         from app.core.config import settings
 
         provider_type = (settings.EMBEDDING_PROVIDER or "").strip().lower()
+        wanted = (model_name or "").strip()
+
+        if provider_type in {"hash", "mock", "simple-local", "local-hash"}:
+            return HashEmbeddingProvider()
 
         # SiliconFlow 在线 API
         if provider_type == "siliconflow":
@@ -158,8 +162,11 @@ class EmbeddingService:
                 model=settings.SILICONFLOW_EMBED_MODEL,
             )
 
+        if provider_type not in {"", "auto", "sentence-transformers", "local", "transformers"}:
+            logger.warning("未知 EMBEDDING_PROVIDER=%s，降级为 hash embedding", settings.EMBEDDING_PROVIDER)
+            return HashEmbeddingProvider()
+
         # 本地 hash / mock
-        wanted = (model_name or "").strip()
         if wanted.lower() in {"", "simple-local", "hash", "mock"}:
             return HashEmbeddingProvider()
 

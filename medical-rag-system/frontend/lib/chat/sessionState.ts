@@ -58,11 +58,18 @@ export function resolveInitialActiveView(conversations: ConversationRecord[], st
     return { kind: 'draft' }
 }
 
-export function buildFallbackSessionSummary(sessionId: string, query: string, timestamp: number): ChatSessionSummary {
+export function buildFallbackSessionSummary(
+    sessionId: string,
+    query: string,
+    timestamp: number,
+    kbId = 'kb_unknown'
+): ChatSessionSummary {
     const iso = new Date(timestamp).toISOString()
     const preview = previewText(query, 80)
     return {
         session_id: sessionId,
+        kb_id: kbId,
+        kb_name: null,
         title: previewText(query, 28) || '新对话',
         status: 'active',
         preview,

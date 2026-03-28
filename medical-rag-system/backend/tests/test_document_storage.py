@@ -2,7 +2,7 @@ import sys
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -23,10 +23,10 @@ class CaptureRepo:
     def upsert_document(self, payload):
         self.payload = payload
 
-    def find_document_by_source_fingerprint(self, _source_fingerprint):
+    def find_document_by_source_fingerprint(self, _kb_id, _source_fingerprint):
         return self.duplicate
 
-    def get_document(self, doc_id, *, include_text=True):
+    def get_document(self, doc_id, *, include_text=True, kb_id=None):
         return self.documents.get(doc_id)
 
     def clear_document_index(self, doc_id):
@@ -81,6 +81,49 @@ class FakeDetailRepo:
         return self.chunk_rows
 
 
+class FakeIndexJobRepo:
+    def __init__(self, doc=None, claim_result=None):
+        self.doc = doc
+        self.claim_result = claim_result
+        self.enqueue_payload = None
+        self.status_updates = []
+        self.completed_jobs = []
+        self.failed_jobs = []
+
+    def get_document(self, doc_id, *, include_text=True):
+        if self.doc and doc_id == self.doc["doc_id"]:
+            return self.doc
+        return None
+
+    def enqueue_index_job(self, **kwargs):
+        self.enqueue_payload = kwargs
+        return {
+            **kwargs,
+            "status": "queued",
+            "attempts": 0,
+            "payload": kwargs["payload"],
+        }
+
+    def update_document_index_status(self, doc_id, parse_status, chunks=None, *, meta_updates=None):
+        self.status_updates.append(
+            {
+                "doc_id": doc_id,
+                "parse_status": parse_status,
+                "chunks": chunks,
+                "meta_updates": meta_updates,
+            }
+        )
+
+    def claim_next_index_job(self, *, now_value):
+        return self.claim_result
+
+    def complete_index_job(self, job_id, *, finished_at):
+        self.completed_jobs.append({"job_id": job_id, "finished_at": finished_at})
+
+    def fail_index_job(self, job_id, *, error_message, finished_at):
+        self.failed_jobs.append({"job_id": job_id, "error_message": error_message, "finished_at": finished_at})
+
+
 class DocumentStorageTests(unittest.TestCase):
     def test_import_document_stores_content_text_outside_meta(self):
         repo = CaptureRepo()
@@ -88,6 +131,8 @@ class DocumentStorageTests(unittest.TestCase):
             with patch.object(settings, "UPLOAD_DIR", "data/uploads"):
                 result = import_document(
                     repo,
+                    kb_id="kb_test",
+                    uploaded_by="user_test",
                     file_name="sample.txt",
                     content=b"employment dispute evidence",
                     doc_type="text",
@@ -178,6 +223,8 @@ class DocumentStorageTests(unittest.TestCase):
         with self.assertRaises(DuplicateDocumentError) as ctx:
             import_document(
                 repo,
+                kb_id="kb_test",
+                uploaded_by="user_test",
                 file_name="sample.txt",
                 content=b"employment dispute evidence",
                 doc_type="text",
@@ -202,6 +249,8 @@ class DocumentStorageTests(unittest.TestCase):
             with patch("app.core.doc_ingestion._store_original_file", return_value="uploads/doc_existing/original.txt"):
                 result = import_document(
                     repo,
+                    kb_id="kb_test",
+                    uploaded_by="user_test",
                     file_name="sample.txt",
                     content=b"new evidence",
                     doc_type="text",
@@ -240,6 +289,7 @@ class DocumentStorageTests(unittest.TestCase):
         )
         service = object.__new__(LegalRagService)
         service.repo = repo
+        service._ensure_citation_access = Mock(return_value=repo.citation)
         service.chunk_lookup = {
             "chunk_view": ChunkRecord(
                 chunk_id="chunk_view",
@@ -253,7 +303,7 @@ class DocumentStorageTests(unittest.TestCase):
 
         with patch.object(settings, "DATA_DIR", "data"):
             with patch("pathlib.Path.exists", return_value=True):
-                result = LegalRagService.get_document_viewer_content(service, doc_id, citation_id)
+                result = LegalRagService.get_document_viewer_content(service, "user_view", doc_id, citation_id)
 
         self.assertEqual(repo.include_text_calls, [True])
         self.assertEqual(result["text"], full_text)
@@ -312,6 +362,82 @@ class DocumentStorageTests(unittest.TestCase):
         self.assertEqual(result["text"], "part one\n\npart two")
         self.assertEqual(len(result["chunk_items"]), 2)
         self.assertEqual(result["chunk_items"][1]["chunk_text"], "part two")
+
+    def test_enqueue_index_job_marks_document_indexing(self):
+        repo = FakeIndexJobRepo(doc={"doc_id": "doc_job", "kb_id": "kb_job"})
+        service = object.__new__(LegalRagService)
+        service.repo = repo
+
+        result = LegalRagService.enqueue_index_job(
+            service,
+            doc_id="doc_job",
+            requested_by="user_job",
+            options={"chunk": {"size": 1024, "overlap": 128}},
+        )
+
+        self.assertTrue(result["job_id"].startswith("idxjob_"))
+        self.assertEqual(result["doc_id"], "doc_job")
+        self.assertEqual(result["kb_id"], "kb_job")
+        self.assertEqual(result["status"], "indexing")
+        self.assertEqual(repo.enqueue_payload["requested_by"], "user_job")
+        self.assertEqual(repo.enqueue_payload["payload"], {"chunk": {"size": 1024, "overlap": 128}})
+        self.assertEqual(repo.status_updates, [{"doc_id": "doc_job", "parse_status": "indexing", "chunks": None, "meta_updates": None}])
+
+    def test_process_next_index_job_completes_successfully(self):
+        repo = FakeIndexJobRepo(
+            claim_result={
+                "job_id": "job_success",
+                "doc_id": "doc_job",
+                "kb_id": "kb_job",
+                "payload": {
+                    "chunk": {"size": 900, "overlap": 100},
+                    "bm25": {"enabled": True},
+                    "vector": {"enabled": True, "embed_model": "test-model"},
+                },
+            }
+        )
+        service = object.__new__(LegalRagService)
+        service.repo = repo
+        service.build_index = Mock(return_value={"doc_id": "doc_job", "status": "indexed", "chunks": 3})
+
+        result = LegalRagService.process_next_index_job(service)
+
+        self.assertEqual(result["status"], "indexed")
+        service.build_index.assert_called_once_with(
+            "doc_job",
+            chunk_size=900,
+            overlap=100,
+            bm25_enabled=True,
+            vector_enabled=True,
+            embed_model="test-model",
+        )
+        self.assertEqual(repo.completed_jobs[0]["job_id"], "job_success")
+        self.assertEqual(repo.failed_jobs, [])
+        self.assertEqual(repo.status_updates, [])
+
+    def test_process_next_index_job_marks_failed_status_when_build_raises(self):
+        repo = FakeIndexJobRepo(
+            claim_result={
+                "job_id": "job_failed",
+                "doc_id": "doc_job",
+                "kb_id": "kb_job",
+                "payload": {},
+            }
+        )
+        service = object.__new__(LegalRagService)
+        service.repo = repo
+        service.build_index = Mock(side_effect=RuntimeError("boom"))
+
+        with patch("app.core.rag_engine.logger.exception") as log_exception:
+            result = LegalRagService.process_next_index_job(service)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error"], "boom")
+        log_exception.assert_called_once()
+        self.assertEqual(repo.completed_jobs, [])
+        self.assertEqual(repo.failed_jobs[0]["job_id"], "job_failed")
+        self.assertEqual(repo.failed_jobs[0]["error_message"], "boom")
+        self.assertEqual(repo.status_updates, [{"doc_id": "doc_job", "parse_status": "failed", "chunks": None, "meta_updates": None}])
 
 
 if __name__ == "__main__":
